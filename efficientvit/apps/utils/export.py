@@ -2,10 +2,14 @@ import io
 import os
 from typing import Any
 
-import onnx
+try:
+    import onnx
+    from onnxsim import simplify as simplify_func
+except ImportError:
+    onnx = None
+    simplify_func = None
 import torch
 import torch.nn as nn
-from onnxsim import simplify as simplify_func
 
 __all__ = ["export_onnx"]
 
@@ -20,6 +24,9 @@ def export_onnx(model: nn.Module, export_path: str, sample_inputs: Any, simplify
         simplify: a flag to turn on onnx-simplifier
         opset: int
     """
+    if onnx is None:
+        raise ImportError("onnx and onnxsim are required for export_onnx. Install with: pip install onnx onnxsim")
+
     model.eval()
 
     buffer = io.BytesIO()

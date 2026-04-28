@@ -10,6 +10,7 @@ from efficientvit.apps import setup
 from efficientvit.apps.utils import dump_config, parse_unknown_args
 from efficientvit.cls_model_zoo import create_efficientvit_cls_model
 from efficientvit.clscore.data_provider import ImageNetDataProvider
+from efficientvit.clscore.pruning import EfficientViTPruner
 from efficientvit.clscore.trainer import ClsRunConfig, ClsTrainer
 from efficientvit.models.nn.drop import apply_drop_func
 
@@ -27,6 +28,20 @@ parser.add_argument("--last_gamma", type=float, default=0)
 
 parser.add_argument("--auto_restart_thresh", type=float, default=1.0)
 parser.add_argument("--save_freq", type=int, default=1)
+
+# Soft Pruning options (optional, opt-in).
+parser.add_argument(
+    "--target_compression",
+    type=float,
+    default=0.0,
+    help="target parameter compression rate (0.0 disables pruning, e.g. 0.3 = remove ~30%).",
+)
+parser.add_argument(
+    "--pruning_max_sparsity",
+    type=float,
+    default=0.95,
+    help="upper bound for per-group sparsity used in bisection.",
+)
 
 
 def main():
@@ -60,12 +75,23 @@ def main():
     model = create_efficientvit_cls_model(config["net_config"]["name"], False, dropout=config["net_config"]["dropout"])
     apply_drop_func(model.backbone.stages, config["backbone_drop"])
 
+    # setup pruner (opt-in via --target_compression > 0).
+    if args.target_compression > 0:
+        pruner = EfficientViTPruner(
+            model,
+            target_compression=args.target_compression,
+            max_sparsity=args.pruning_max_sparsity,
+        )
+    else:
+        pruner = None
+
     # setup trainer
     trainer = ClsTrainer(
         path=args.path,
         model=model,
         data_provider=data_provider,
         auto_restart_thresh=args.auto_restart_thresh,
+        pruner=pruner,
     )
     # initialization
     setup.init_model(

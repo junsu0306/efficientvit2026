@@ -23,6 +23,7 @@ class ClsTrainer(Trainer):
         model: nn.Module,
         data_provider,
         auto_restart_thresh: Optional[float] = None,
+        pruner: Optional[Any] = None,
     ) -> None:
         super().__init__(
             path=path,
@@ -30,6 +31,8 @@ class ClsTrainer(Trainer):
             data_provider=data_provider,
         )
         self.auto_restart_thresh = auto_restart_thresh
+        # Soft Pruning 컨트롤러 (None 이면 base.after_step 의 hook 이 no-op).
+        self.pruner = pruner
         self.test_criterion = nn.CrossEntropyLoss()
 
     def _validate(self, model, data_loader, epoch) -> dict[str, Any]:

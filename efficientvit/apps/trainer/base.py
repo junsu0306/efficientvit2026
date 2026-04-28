@@ -274,6 +274,12 @@ class Trainer:
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
+        # Soft Pruning: optimizer.step() 직후, EMA 업데이트 이전에 마스킹.
+        # pruner 가 attach 되어 있지 않으면 no-op.
+        pruner = getattr(self, "pruner", None)
+        if pruner is not None:
+            pruner.apply(self.network)
+
         self.lr_scheduler.step()
         self.run_config.step()
         # update ema
