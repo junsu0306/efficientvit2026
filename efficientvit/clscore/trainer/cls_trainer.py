@@ -24,6 +24,8 @@ class ClsTrainer(Trainer):
         data_provider,
         auto_restart_thresh: Optional[float] = None,
         pruner: Optional[Any] = None,
+        wandb_project: Optional[str] = None,
+        wandb_run_name: Optional[str] = None,
     ) -> None:
         super().__init__(
             path=path,
@@ -33,6 +35,8 @@ class ClsTrainer(Trainer):
         self.auto_restart_thresh = auto_restart_thresh
         # Soft Pruning 컨트롤러 (None 이면 base.after_step 의 hook 이 no-op).
         self.pruner = pruner
+        self.wandb_project = wandb_project
+        self.wandb_run_name = wandb_run_name or None
         self.test_criterion = nn.CrossEntropyLoss()
 
     def _validate(self, model, data_loader, epoch) -> dict[str, Any]:
@@ -194,6 +198,27 @@ class ClsTrainer(Trainer):
         else:
             self.train_criterion = nn.CrossEntropyLoss()
 
+        # wandb 초기화 (main process only, project 지정 시에만 활성화)
+        use_wandb = bool(self.wandb_project) and is_master()
+        if use_wandb:
+            try:
+                import wandb
+                wandb.init(
+                    project=self.wandb_project,
+                    name=self.wandb_run_name,
+                    config={
+                        "model": type(self.network).__name__,
+                        "n_parameters": sum(p.numel() for p in self.network.parameters()),
+                        "pruner_sparsity": getattr(self.pruner, "sparsity", None),
+                        "target_compression": getattr(self.pruner, "target_compression", None),
+                    },
+                    resume="allow",
+                )
+                wandb.watch(self.network, log="gradients", log_freq=500)
+            except Exception as e:
+                self.write_log(f"[wandb] init failed: {e}. Continuing without wandb.")
+                use_wandb = False
+
         for epoch in range(self.start_epoch, self.run_config.n_epochs + self.run_config.warmup_epochs):
             train_info_dict = self.train_one_epoch(epoch)
             # eval
@@ -224,6 +249,27 @@ class ClsTrainer(Trainer):
             )
             self.write_log(val_log, prefix="valid", print_log=False)
 
+            # wandb 로깅
+            if use_wandb:
+                import wandb
+                first_val = list(val_info_dict.values())[0]
+                log_dict = {
+                    "epoch": epoch,
+                    "train/loss": train_info_dict.get("train_loss", 0),
+                    "train/top1": train_info_dict.get("train_top1", 0),
+                    "train/lr": self.optimizer.param_groups[0]["lr"],
+                    "val/top1": avg_top1,
+                    "val/top1_best": self.best_val,
+                }
+                if "val_top5" in first_val:
+                    log_dict["val/top5"] = list_mean([d.get("val_top5", 0) for d in val_info_dict.values()])
+                if "val_loss" in first_val:
+                    log_dict["val/loss"] = list_mean([d.get("val_loss", 0) for d in val_info_dict.values()])
+                if self.pruner is not None:
+                    for k, v in self.pruner.log_sparsity(self.network).items():
+                        log_dict[f"pruning/{k}"] = v
+                wandb.log(log_dict, step=self.run_config.global_step)
+
             # save model
             if (epoch + 1) % save_freq == 0 or (is_best and self.run_config.progress > 0.8):
                 self.save_model(
@@ -231,3 +277,7 @@ class ClsTrainer(Trainer):
                     epoch=epoch,
                     model_name="model_best.pt" if is_best else "checkpoint.pt",
                 )
+
+        if use_wandb:
+            import wandb
+            wandb.finish()

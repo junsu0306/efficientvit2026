@@ -43,6 +43,11 @@ parser.add_argument(
     help="upper bound for per-group sparsity used in bisection.",
 )
 
+# Weights & Biases logging (optional, opt-in).
+parser.add_argument("--wandb", action="store_true", help="enable wandb logging.")
+parser.add_argument("--wandb_project", type=str, default="efficientvit-pruning", help="wandb project name.")
+parser.add_argument("--wandb_run_name", type=str, default="", help="wandb run name (auto-generated if empty).")
+
 
 def main():
     # parse args
@@ -92,6 +97,8 @@ def main():
         data_provider=data_provider,
         auto_restart_thresh=args.auto_restart_thresh,
         pruner=pruner,
+        wandb_project=args.wandb_project if args.wandb else None,
+        wandb_run_name=args.wandb_run_name or None,
     )
     # initialization
     setup.init_model(
