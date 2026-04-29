@@ -15,6 +15,10 @@ assets/checkpoints/
 assets/data/
 assets/export_models/
 
+# 서버 전용 — 데이터셋 및 학습 결과물
+data/
+output/
+
 applications/efficientvit_gazesam/models/pytorch
 applications/efficientvit_gazesam/models/onnx
 applications/efficientvit_gazesam/models/tensorrt
