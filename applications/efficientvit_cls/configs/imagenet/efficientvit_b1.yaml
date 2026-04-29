@@ -5,3 +5,8 @@ data_provider:
 net_config:
   name: efficientvit-b1
   dropout: 0
+
+run_config:
+  n_epochs: 45
+  warmup_epochs: 5
+  warmup_lr: 1.0e-06

@@ -734,19 +734,19 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 --master_port=12345 \
     --data_provider.data_dir /workspace/etri_iitp/JS/efficientvit2026/data/imagenet
 ```
 
-#### 9.2-B. target=20%
+#### 9.2-B. target=30%
 
 ```bash
-CUDA_VISIBLE_DEVICES=4 torchrun --nproc_per_node=1 --master_port=12345 \
+CUDA_VISIBLE_DEVICES=5 torchrun --nproc_per_node=1 --master_port=12345 \
   applications/efficientvit_cls/train_efficientvit_cls_model.py \
     applications/efficientvit_cls/configs/imagenet/efficientvit_b1.yaml \
-    --path /workspace/etri_iitp/JS/efficientvit2026/output/b1_prune20 \
+    --path /workspace/etri_iitp/JS/efficientvit2026/output/b1_prune30 \
     --init_from assets/checkpoints/efficientvit_cls/efficientvit_b1_r224.pt \
     --amp bf16 \
-    --target_compression 0.20 \
+    --target_compression 0.30 \
     --wandb \
     --wandb_project efficientvit-pruning \
-    --wandb_run_name b1_prune20 \
+    --wandb_run_name b1_prune30 \
     --data_provider.data_dir /workspace/etri_iitp/JS/efficientvit2026/data/imagenet
 ```
 
