@@ -172,6 +172,18 @@ class ClsTrainer(Trainer):
                 if output_dict["top1"] is not None:
                     train_top1.update(output_dict["top1"], images.shape[0])
 
+                # step-level wandb 로깅 (50 step 마다 — 에폭 완료 전에도 loss 를 볼 수 있도록)
+                if getattr(self, "_use_wandb", False) and self.run_config.global_step % 50 == 0:
+                    import wandb as _wandb
+
+                    _step_log = {
+                        "step/loss": train_loss.avg,
+                        "step/lr": self.optimizer.param_groups[0]["lr"],
+                    }
+                    if train_top1.count > 0:
+                        _step_log["step/top1"] = train_top1.avg
+                    _wandb.log(_step_log, step=self.run_config.global_step)
+
                 # tqdm
                 postfix_dict = {
                     "loss": train_loss.avg,
@@ -200,6 +212,7 @@ class ClsTrainer(Trainer):
 
         # wandb 초기화 (main process only, project 지정 시에만 활성화)
         use_wandb = bool(self.wandb_project) and is_master()
+        self._use_wandb = use_wandb  # _train_one_epoch 에서 step-level 로깅에 참조
         if use_wandb:
             try:
                 import wandb
