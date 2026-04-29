@@ -25,6 +25,12 @@ parser.add_argument("--amp", type=str, choices=["fp32", "fp16", "bf16"], default
 # initialization
 parser.add_argument("--rand_init", type=str, default="trunc_normal@0.02")
 parser.add_argument("--last_gamma", type=float, default=0)
+parser.add_argument(
+    "--init_from",
+    type=str,
+    default=None,
+    help="pretrained checkpoint path for fine-tuning (e.g. assets/checkpoints/efficientvit_cls/efficientvit_b1_r224.pt).",
+)
 
 parser.add_argument("--auto_restart_thresh", type=float, default=1.0)
 parser.add_argument("--save_freq", type=int, default=1)
@@ -100,9 +106,10 @@ def main():
         wandb_project=args.wandb_project if args.wandb else None,
         wandb_run_name=args.wandb_run_name or None,
     )
-    # initialization
+    # initialization (fine-tune: --init_from 으로 pretrained weight 로드)
     setup.init_model(
         trainer.network,
+        init_from=args.init_from,
         rand_init=args.rand_init,
         last_gamma=args.last_gamma,
     )

@@ -11,7 +11,9 @@ __pycache__/
 wandb/
 tmp/
 
-assets/checkpoints/
+assets/checkpoints/**/*.pt
+assets/checkpoints/**/*.pth
+!assets/checkpoints/efficientvit_cls/efficientvit_b1_r224.pt
 assets/data/
 assets/export_models/
 
