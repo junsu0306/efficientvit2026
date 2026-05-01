@@ -721,7 +721,7 @@ CUDA_VISIBLE_DEVICES=4 torchrun --nproc_per_node=1 --master_port=12345 \
 GPU 4장:
 
 ```bash
-CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 --master_port=12345 \
+CUDA_VISIBLE_DEVICES=3,4 torchrun --nproc_per_node=2 --master_port=12345 \
   applications/efficientvit_cls/train_efficientvit_cls_model.py \
     applications/efficientvit_cls/configs/imagenet/efficientvit_b1.yaml \
     --path /workspace/etri_iitp/JS/efficientvit2026/output/b1_prune15 \
@@ -737,7 +737,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 --master_port=12345 \
 #### 9.2-B. target=30%
 
 ```bash
-CUDA_VISIBLE_DEVICES=5 torchrun --nproc_per_node=1 --master_port=12345 \
+CUDA_VISIBLE_DEVICES=5,6 torchrun --nproc_per_node=2 --master_port=12346 \
   applications/efficientvit_cls/train_efficientvit_cls_model.py \
     applications/efficientvit_cls/configs/imagenet/efficientvit_b1.yaml \
     --path /workspace/etri_iitp/JS/efficientvit2026/output/b1_prune30 \
@@ -1122,3 +1122,7 @@ default config 에서는 영향 없으나, `local_module=GLUMBConv` 사용 시 �
 - DDP 환경에서 `self.network` (= `model.module if parallel`) 전달 ✓
 - 인덱스 산정 = expand 출력 필터 L2 norm 의 하위 topk ✓
 - coupled 인덱스 동기화 (expand-shrink, DW groups, chain) ✓
+- ImageNet 학습셋: 약 1,281,167장
+DistributedSampler: 전체를 GPU 수로 나눔 → GPU 1장당 ~640,584장
+batch_size per GPU: 128
+1 epoch steps: 640,584 ÷ 128 ≈ ~5,004 steps
