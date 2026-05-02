@@ -415,6 +415,18 @@ def main(args):
         test_stats = evaluate(data_loader_val, model, device)
         print(
             f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        if args.wandb and utils.is_main_process():
+            import wandb
+            wandb.log({
+                'val/acc1': test_stats['acc1'],
+                'val/acc5': test_stats['acc5'],
+                'val/loss': test_stats['loss'],
+            })
+            wandb.summary.update({
+                'val/acc1': test_stats['acc1'],
+                'val/acc5': test_stats['acc5'],
+            })
+            wandb.finish()
         return
 
     # Soft Pruner 초기화 (모델 생성 및 GPU 이동 완료 후)

@@ -48,6 +48,13 @@ parser.add_argument(
     default=0.95,
     help="upper bound for per-group sparsity used in bisection.",
 )
+parser.add_argument(
+    "--pruning_head_sparsity_scale",
+    type=float,
+    default=0.5,
+    help="head sparsity = backbone_sparsity × scale. 0.0 disables head pruning. "
+         "G_HEAD1 은 내부적으로 0.40 상한이 별도 적용된다.",
+)
 
 # Weights & Biases logging (optional, opt-in).
 parser.add_argument("--wandb", action="store_true", help="enable wandb logging.")
@@ -92,6 +99,7 @@ def main():
             model,
             target_compression=args.target_compression,
             max_sparsity=args.pruning_max_sparsity,
+            head_sparsity_scale=args.pruning_head_sparsity_scale,
         )
     else:
         pruner = None

@@ -317,6 +317,82 @@ def _reduce_fusedmbconv(fmb: FusedMBConv) -> None:
 
 
 # ---------------------------------------------------------------------------
+# ClsHead (G_HEAD0 → G_HEAD1) — reducing
+# G_HEAD0 먼저 실행해야 op_list[2].linear.in_features 가 줄어든 상태에서 G_HEAD1 이 작동.
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def _reduce_head0(model: nn.Module) -> None:
+    """G_HEAD0: op_list[0] Conv 출력 필터 + BN 축소 → op_list[2] Linear 입력 컬럼 축소."""
+    head = getattr(model, "head", None)
+    if head is None or not hasattr(head, "op_list") or len(head.op_list) < 4:
+        return
+    if not hasattr(head.op_list[0], "conv") or not hasattr(head.op_list[2], "linear"):
+        return
+
+    conv_layer = head.op_list[0]
+    survived = _survived_idx(conv_layer.conv.weight)
+    n_new = survived.numel()
+    if n_new == conv_layer.conv.weight.shape[0]:
+        return
+
+    in_ch = conv_layer.conv.weight.shape[1]
+    _reduce_convlayer_out(conv_layer, survived, in_channels=in_ch, groups=conv_layer.conv.groups)
+
+    # op_list[2].linear: 입력 컬럼만 축소 (출력 행은 그대로).
+    old_lin = head.op_list[2].linear
+    new_lin = nn.Linear(n_new, old_lin.out_features, bias=(old_lin.bias is not None))
+    new_lin.weight.data.copy_(old_lin.weight.data[:, survived])
+    if old_lin.bias is not None:
+        new_lin.bias.data.copy_(old_lin.bias.data)
+    head.op_list[2].linear = new_lin.to(old_lin.weight.device).to(old_lin.weight.dtype)
+
+
+@torch.no_grad()
+def _reduce_head1(model: nn.Module) -> None:
+    """G_HEAD1: op_list[2] Linear 출력 행 + LayerNorm 축소 → op_list[3] Linear 입력 컬럼 축소."""
+    head = getattr(model, "head", None)
+    if head is None or not hasattr(head, "op_list") or len(head.op_list) < 4:
+        return
+    if not hasattr(head.op_list[2], "linear") or not hasattr(head.op_list[3], "linear"):
+        return
+
+    lin2 = head.op_list[2].linear
+    survived = _survived_idx(lin2.weight)
+    n_new = survived.numel()
+    if n_new == lin2.weight.shape[0]:
+        return
+
+    dev, dtype = lin2.weight.device, lin2.weight.dtype
+
+    # op_list[2].linear: 출력 행 축소.
+    new_lin2 = nn.Linear(lin2.in_features, n_new, bias=(lin2.bias is not None))
+    new_lin2.weight.data.copy_(lin2.weight.data[survived])
+    if lin2.bias is not None:
+        new_lin2.bias.data.copy_(lin2.bias.data[survived])
+    head.op_list[2].linear = new_lin2.to(dev).to(dtype)
+
+    # op_list[2].norm (LayerNorm): normalized_shape 축소.
+    old_ln = head.op_list[2].norm
+    if old_ln is not None and isinstance(old_ln, nn.LayerNorm):
+        new_ln = nn.LayerNorm(n_new, eps=old_ln.eps, elementwise_affine=old_ln.elementwise_affine)
+        if old_ln.weight is not None:
+            new_ln.weight.data.copy_(old_ln.weight.data[survived])
+        if old_ln.bias is not None:
+            new_ln.bias.data.copy_(old_ln.bias.data[survived])
+        head.op_list[2].norm = new_ln.to(dev).to(dtype)
+
+    # op_list[3].linear: 입력 컬럼 축소 (출력 n_classes 와 bias 는 그대로).
+    old_lin3 = head.op_list[3].linear
+    new_lin3 = nn.Linear(n_new, old_lin3.out_features, bias=(old_lin3.bias is not None))
+    new_lin3.weight.data.copy_(old_lin3.weight.data[:, survived])
+    if old_lin3.bias is not None:
+        new_lin3.bias.data.copy_(old_lin3.bias.data)
+    head.op_list[3].linear = new_lin3.to(old_lin3.weight.device).to(old_lin3.weight.dtype)
+
+
+# ---------------------------------------------------------------------------
 # 모델 전체 reduce
 # ---------------------------------------------------------------------------
 
@@ -328,7 +404,7 @@ def reduce_efficientvit_cls_model(model: nn.Module) -> nn.Module:
     순서:
       1) MBConv / FusedMBConv mid_channels 축소.
       2) Input stem chain 축소 + stage1 첫 conv 입력 컬럼 축소.
-         (stem 출력 채널이 stage1 첫 conv 입력 채널이라 stem 후 처리 가능.)
+      3) ClsHead G_HEAD0 → G_HEAD1 순서로 축소 (순서 반드시 유지).
     """
     for module in model.modules():
         if isinstance(module, MBConv):
@@ -336,6 +412,8 @@ def reduce_efficientvit_cls_model(model: nn.Module) -> nn.Module:
         elif isinstance(module, FusedMBConv):
             _reduce_fusedmbconv(module)
     _reduce_input_stem(model)
+    _reduce_head0(model)  # G_HEAD0 먼저: op_list[2].linear in_features 변경
+    _reduce_head1(model)  # G_HEAD1 다음: 변경된 op_list[2].linear 기준으로 out_rows 변경
     return model
 
 

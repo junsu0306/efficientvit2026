@@ -381,6 +381,102 @@ def _estimate_removed_input_stem(model: nn.Module, sparsity: float) -> int:
 
 
 # ---------------------------------------------------------------------------
+# ClsHead (G_HEAD0 + G_HEAD1) — 마스킹 + 제거 파라미터 추정
+# ---------------------------------------------------------------------------
+
+# op_list[3] 은 width_list[1]→n_classes (B1: 1600→1000, 1.6×) 로 이미 near-complete.
+# 여기서 너무 많이 자르면 under-complete 매핑 → 표현력 급감.
+_HEAD1_MAX_SPARSITY = 0.40
+
+
+def _prune_head0(head: nn.Module, sparsity: float) -> None:
+    """G_HEAD0: op_list[0] Conv 출력 필터 + BN → op_list[2] Linear 입력 컬럼 마스킹."""
+    weight = head.op_list[0].conv.weight  # (width_list[0], in_ch, 1, 1)
+    n_total = weight.shape[0]
+    n_prune = _calc_n_prune(n_total, sparsity)
+    if n_prune <= 0:
+        return
+    idx = _topk_smallest_l2_idx(weight, n_prune)
+
+    with torch.no_grad():
+        head.op_list[0].conv.weight.data[idx] = 0.0
+        if head.op_list[0].conv.bias is not None:
+            head.op_list[0].conv.bias.data[idx] = 0.0
+        _zero_bn_(head.op_list[0].norm, idx)  # BN2d
+        # AdaptiveAvgPool2d + _try_squeeze 가 채널 순서를 보존하므로 같은 idx 적용.
+        head.op_list[2].linear.weight.data[:, idx] = 0.0
+
+
+def _prune_head1(head: nn.Module, sparsity: float) -> None:
+    """G_HEAD1: op_list[2] Linear 출력 행 + LayerNorm → op_list[3] Linear 입력 컬럼 마스킹."""
+    effective_sp = min(sparsity, _HEAD1_MAX_SPARSITY)
+    weight = head.op_list[2].linear.weight  # (width_list[1], width_list[0])
+    n_total = weight.shape[0]
+    n_prune = _calc_n_prune(n_total, effective_sp)
+    if n_prune <= 0:
+        return
+    idx = _topk_smallest_l2_idx(weight, n_prune)
+
+    with torch.no_grad():
+        head.op_list[2].linear.weight.data[idx] = 0.0
+        if head.op_list[2].linear.bias is not None:
+            head.op_list[2].linear.bias.data[idx] = 0.0
+        _zero_bn_(head.op_list[2].norm, idx)  # LayerNorm (weight/bias만, running stats 없음)
+        # op_list[3].linear.bias 는 출력(n_classes) 소속이므로 건드리지 않음.
+        head.op_list[3].linear.weight.data[:, idx] = 0.0
+
+
+def _estimate_removed_head0(head: nn.Module, sparsity: float) -> int:
+    weight = head.op_list[0].conv.weight  # (w0, in_ch, 1, 1)
+    n_total, in_ch = weight.shape[0], weight.shape[1]
+    out_features = head.op_list[2].linear.weight.shape[0]
+
+    n_prune = _calc_n_prune(n_total, sparsity)
+    if n_prune <= 0:
+        return 0
+
+    removed = n_prune * in_ch  # op_list[0] Conv 출력 필터 (1×1 kernel)
+    if head.op_list[0].conv.bias is not None:
+        removed += n_prune
+    if getattr(head.op_list[0].norm, "weight", None) is not None:
+        removed += n_prune * 2  # BN weight + bias
+    removed += n_prune * out_features  # op_list[2] Linear 입력 컬럼
+    # cross-term (n_prune_h0 × n_prune_h1) 무시 → 약간 over-estimate (안전 방향)
+    return removed
+
+
+def _estimate_removed_head1(head: nn.Module, sparsity: float) -> int:
+    effective_sp = min(sparsity, _HEAD1_MAX_SPARSITY)
+    weight = head.op_list[2].linear.weight  # (w1, w0)
+    n_total, in_features = weight.shape[0], weight.shape[1]
+    out_classes = head.op_list[3].linear.weight.shape[0]
+
+    n_prune = _calc_n_prune(n_total, effective_sp)
+    if n_prune <= 0:
+        return 0
+
+    removed = n_prune * in_features  # op_list[2] Linear 출력 행
+    if head.op_list[2].linear.bias is not None:
+        removed += n_prune
+    if getattr(head.op_list[2].norm, "weight", None) is not None:
+        removed += n_prune * 2  # LayerNorm weight + bias
+    removed += n_prune * out_classes  # op_list[3] Linear 입력 컬럼
+    # op_list[3].bias (n_classes) 는 출력 소속이라 제거 대상 아님
+    return removed
+
+
+def _has_prunable_head(model: nn.Module) -> bool:
+    head = getattr(model, "head", None)
+    return (
+        head is not None
+        and hasattr(head, "op_list")
+        and len(head.op_list) >= 4
+        and hasattr(head.op_list[0], "conv")
+        and hasattr(head.op_list[2], "linear")
+    )
+
+
+# ---------------------------------------------------------------------------
 # 모델 전체 enumerate / 추정 / sparsity 이진탐색
 # ---------------------------------------------------------------------------
 
@@ -398,7 +494,7 @@ def _count_total_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
-def _estimate_total_removed(model: nn.Module, sparsity: float) -> int:
+def _estimate_total_removed(model: nn.Module, sparsity: float, head_sparsity_scale: float = 0.0) -> int:
     total = 0
     for kind, mod in _iter_prunable_modules(model):
         if kind == "mbconv":
@@ -406,6 +502,11 @@ def _estimate_total_removed(model: nn.Module, sparsity: float) -> int:
         elif kind == "fmbconv":
             total += _estimate_removed_fusedmbconv(mod, sparsity)
     total += _estimate_removed_input_stem(model, sparsity)
+    if head_sparsity_scale > 0 and _has_prunable_head(model):
+        head_sp = sparsity * head_sparsity_scale
+        head = model.head  # type: ignore[attr-defined]
+        total += _estimate_removed_head0(head, head_sp)
+        total += _estimate_removed_head1(head, head_sp)
     return total
 
 
@@ -414,8 +515,9 @@ def _find_sparsity_by_bisection(
     target_compression: float,
     max_sparsity: float = 0.95,
     iters: int = 64,
+    head_sparsity_scale: float = 0.0,
 ) -> float:
-    """이진탐색으로 target_compression 비율을 만족시키는 per-group sparsity 를 찾는다."""
+    """이진탐색으로 target_compression 비율을 만족시키는 per-group (backbone) sparsity 를 찾는다."""
     if target_compression <= 0:
         return 0.0
     total = _count_total_params(model)
@@ -423,7 +525,7 @@ def _find_sparsity_by_bisection(
     lo, hi = 0.0, max_sparsity
     for _ in range(iters):
         mid = 0.5 * (lo + hi)
-        if _estimate_total_removed(model, mid) < target_remove:
+        if _estimate_total_removed(model, mid, head_sparsity_scale) < target_remove:
             lo = mid
         else:
             hi = mid
@@ -442,6 +544,12 @@ class EfficientViTPruner:
         pruner = EfficientViTPruner(model, target_compression=0.30)
         # ... 학습 루프 안에서, optimizer.step() 직후:
         pruner.apply(model)
+
+    head_sparsity_scale:
+        Head sparsity = backbone sparsity × scale.
+        0.0 이면 head pruning 비활성 (기존 동작).
+        0.5 (기본값) 이면 backbone의 절반 sparsity 로 head 를 pruning.
+        G_HEAD1 은 내부적으로 _HEAD1_MAX_SPARSITY(=0.40) 상한이 적용된다.
     """
 
     def __init__(
@@ -450,25 +558,34 @@ class EfficientViTPruner:
         target_compression: float,
         max_sparsity: float = 0.95,
         sparsity: float | None = None,
+        head_sparsity_scale: float = 0.5,
     ) -> None:
         self.target_compression = float(target_compression)
         self.max_sparsity = float(max_sparsity)
+        self.head_sparsity_scale = float(head_sparsity_scale)
         if sparsity is not None:
             self.sparsity = float(sparsity)
         else:
             self.sparsity = _find_sparsity_by_bisection(
-                model, self.target_compression, self.max_sparsity
+                model, self.target_compression, self.max_sparsity,
+                head_sparsity_scale=self.head_sparsity_scale,
             )
 
-        # 간단한 통계 로그.
         n_groups = sum(1 for _ in _iter_prunable_modules(model))
         total = _count_total_params(model)
-        est_removed = _estimate_total_removed(model, self.sparsity)
+        est_removed = _estimate_total_removed(model, self.sparsity, self.head_sparsity_scale)
         rate = 100.0 * est_removed / max(total, 1)
+        head_info = (
+            f"head_sparsity={self.sparsity * self.head_sparsity_scale:.4f} "
+            f"(scale={self.head_sparsity_scale})"
+            if self.head_sparsity_scale > 0 and _has_prunable_head(model)
+            else "head=disabled"
+        )
         print(
             f"[EfficientViTPruner] target={self.target_compression*100:.1f}% "
-            f"per-group sparsity={self.sparsity:.4f} "
-            f"prunable_groups={n_groups} estimated_compression={rate:.2f}%"
+            f"backbone_sparsity={self.sparsity:.4f} "
+            f"prunable_groups={n_groups} estimated_compression={rate:.2f}% "
+            f"{head_info}"
         )
 
     def apply(self, model: nn.Module) -> None:
@@ -481,10 +598,15 @@ class EfficientViTPruner:
             elif kind == "fmbconv":
                 _prune_fusedmbconv(mod, self.sparsity)
         _prune_input_stem(model, self.sparsity)
+        if self.head_sparsity_scale > 0 and _has_prunable_head(model):
+            head_sp = self.sparsity * self.head_sparsity_scale
+            head = model.head  # type: ignore[attr-defined]
+            _prune_head0(head, head_sp)
+            _prune_head1(head, head_sp)
 
     @torch.no_grad()
     def log_sparsity(self, model: nn.Module) -> dict[str, float]:
-        """실제 마스킹된 zero 비율 (검증용). MBConv/FusedMBConv mid + Stem 출력 채널."""
+        """실제 마스킹된 zero 비율 (검증용). MBConv/FusedMBConv mid + Stem + Head 출력 채널."""
         n_total = 0
         n_zero = 0
         for kind, mod in _iter_prunable_modules(model):
@@ -504,6 +626,21 @@ class EfficientViTPruner:
             norms = torch.norm(w.detach().reshape(n_filt, -1), dim=1)
             n_total += n_filt
             n_zero += int((norms == 0).sum().item())
+        # Head 출력 채널 zero 집계 (head pruning 활성 시).
+        if self.head_sparsity_scale > 0 and _has_prunable_head(model):
+            head = model.head  # type: ignore[attr-defined]
+            # G_HEAD0: op_list[0] Conv 출력 필터
+            w0 = head.op_list[0].conv.weight
+            n0 = w0.shape[0]
+            norms0 = torch.norm(w0.detach().reshape(n0, -1), dim=1)
+            n_total += n0
+            n_zero += int((norms0 == 0).sum().item())
+            # G_HEAD1: op_list[2] Linear 출력 행
+            w1 = head.op_list[2].linear.weight
+            n1 = w1.shape[0]
+            norms1 = torch.norm(w1.detach(), dim=1)
+            n_total += n1
+            n_zero += int((norms1 == 0).sum().item())
         return {
             "prunable_filters": n_total,
             "zero_filters": n_zero,
