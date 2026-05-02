@@ -225,9 +225,7 @@ class ClsTrainer(Trainer):
                         "pruner_sparsity": getattr(self.pruner, "sparsity", None),
                         "target_compression": getattr(self.pruner, "target_compression", None),
                     },
-                    resume="allow",
                 )
-                wandb.watch(self.network, log="gradients", log_freq=500)
             except Exception as e:
                 self.write_log(f"[wandb] init failed: {e}. Continuing without wandb.")
                 use_wandb = False

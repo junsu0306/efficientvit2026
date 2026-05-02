@@ -41,6 +41,9 @@ def main():
     parser.add_argument("--crop_ratio", type=float, default=0.95)
     parser.add_argument("--model", type=str)
     parser.add_argument("--weight_url", type=str, default=None)
+    parser.add_argument("--wandb", action="store_true", help="enable wandb logging.")
+    parser.add_argument("--wandb_project", type=str, default="efficientvit-pruning")
+    parser.add_argument("--wandb_run_name", type=str, default="")
 
     args = parser.parse_args()
     if args.gpu == "all":
@@ -101,6 +104,25 @@ def main():
                 t.update(1)
 
     print(f"Top1 Acc={top1.avg:.3f}, Top5 Acc={top5.avg:.3f}")
+
+    if args.wandb:
+        try:
+            import wandb
+            wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name or f"eval_{args.model}",
+                config={
+                    "model": args.model,
+                    "weight_url": args.weight_url,
+                    "image_size": args.image_size,
+                    "crop_ratio": args.crop_ratio,
+                    "batch_size": args.batch_size,
+                },
+            )
+            wandb.log({"val/top1": top1.avg, "val/top5": top5.avg})
+            wandb.finish()
+        except Exception as e:
+            print(f"[wandb] logging failed: {e}")
 
 
 if __name__ == "__main__":
