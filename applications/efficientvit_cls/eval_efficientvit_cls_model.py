@@ -80,15 +80,21 @@ def main():
         drop_last=False,
     )
 
-    ckpt = torch.load(args.weight_url, map_location="cpu") if args.weight_url else None
-    if isinstance(ckpt, dict) and "compression_rate" in ckpt:
-        # reduced checkpoint: create full model → reduce → load state_dict
-        print(f"=> detected reduced checkpoint (compression {ckpt['compression_rate']:.2f}%)")
-        model = create_efficientvit_cls_model(args.model, pretrained=False)
-        reduce_efficientvit_cls_model(model)
-        model.load_state_dict(ckpt["state_dict"])
+    if args.weight_url:
+        raw = torch.load(args.weight_url, map_location="cpu")
+        if isinstance(raw, torch.nn.Module):
+            # saved with --save-full-model: architecture already embedded
+            print(f"=> loaded full model object from {args.weight_url}")
+            model = raw
+        elif isinstance(raw, dict) and "compression_rate" in raw:
+            raise ValueError(
+                "Reduced state_dict detected. Re-run reduce script with --save-full-model "
+                "to embed the architecture, then point --weight_url to the new file."
+            )
+        else:
+            model = create_efficientvit_cls_model(args.model, weight_url=args.weight_url)
     else:
-        model = create_efficientvit_cls_model(args.model, weight_url=args.weight_url)
+        model = create_efficientvit_cls_model(args.model)
     model = torch.nn.DataParallel(model).cuda()
     model.eval()
 
