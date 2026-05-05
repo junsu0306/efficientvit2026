@@ -81,7 +81,7 @@ def main():
     )
 
     if args.weight_url:
-        raw = torch.load(args.weight_url, map_location="cpu")
+        raw = torch.load(args.weight_url, map_location="cpu", weights_only=False)
         if isinstance(raw, torch.nn.Module):
             # saved with --save-full-model: architecture already embedded
             print(f"=> loaded full model object from {args.weight_url}")
