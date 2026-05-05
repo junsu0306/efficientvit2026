@@ -12,8 +12,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(os.path.dirname(BASE_DIR))
 sys.path.append(ROOT_DIR)
 
+import torch
+
 from efficientvit.apps.utils import AverageMeter
 from efficientvit.cls_model_zoo import create_efficientvit_cls_model
+from efficientvit.clscore.pruning.efficientvit_reducing import reduce_efficientvit_cls_model
 
 
 def accuracy(output: torch.Tensor, target: torch.Tensor, topk=(1,)) -> list[torch.Tensor]:
@@ -77,7 +80,15 @@ def main():
         drop_last=False,
     )
 
-    model = create_efficientvit_cls_model(args.model, weight_url=args.weight_url)
+    ckpt = torch.load(args.weight_url, map_location="cpu") if args.weight_url else None
+    if isinstance(ckpt, dict) and "compression_rate" in ckpt:
+        # reduced checkpoint: create full model → reduce → load state_dict
+        print(f"=> detected reduced checkpoint (compression {ckpt['compression_rate']:.2f}%)")
+        model = create_efficientvit_cls_model(args.model, pretrained=False)
+        reduce_efficientvit_cls_model(model)
+        model.load_state_dict(ckpt["state_dict"])
+    else:
+        model = create_efficientvit_cls_model(args.model, weight_url=args.weight_url)
     model = torch.nn.DataParallel(model).cuda()
     model.eval()
 
