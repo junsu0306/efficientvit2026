@@ -26,6 +26,7 @@ class ClsTrainer(Trainer):
         pruner: Optional[Any] = None,
         wandb_project: Optional[str] = None,
         wandb_run_name: Optional[str] = None,
+        wandb_run_id: Optional[str] = None,
     ) -> None:
         super().__init__(
             path=path,
@@ -37,6 +38,7 @@ class ClsTrainer(Trainer):
         self.pruner = pruner
         self.wandb_project = wandb_project
         self.wandb_run_name = wandb_run_name or None
+        self.wandb_run_id = wandb_run_id or None
         self.test_criterion = nn.CrossEntropyLoss()
 
     def _validate(self, model, data_loader, epoch) -> dict[str, Any]:
@@ -219,6 +221,8 @@ class ClsTrainer(Trainer):
                 wandb.init(
                     project=self.wandb_project,
                     name=self.wandb_run_name,
+                    id=self.wandb_run_id,
+                    resume="allow" if self.wandb_run_id else None,
                     config={
                         "model": type(self.network).__name__,
                         "n_parameters": sum(p.numel() for p in self.network.parameters()),

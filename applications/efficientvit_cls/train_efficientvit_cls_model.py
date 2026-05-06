@@ -60,6 +60,7 @@ parser.add_argument(
 parser.add_argument("--wandb", action="store_true", help="enable wandb logging.")
 parser.add_argument("--wandb_project", type=str, default="efficientvit-pruning", help="wandb project name.")
 parser.add_argument("--wandb_run_name", type=str, default="", help="wandb run name (auto-generated if empty).")
+parser.add_argument("--wandb_run_id", type=str, default="", help="wandb run id to resume an existing run.")
 
 
 def main():
@@ -113,6 +114,7 @@ def main():
         pruner=pruner,
         wandb_project=args.wandb_project if args.wandb else None,
         wandb_run_name=args.wandb_run_name or None,
+        wandb_run_id=args.wandb_run_id or None,
     )
     # initialization (fine-tune: --init_from 으로 pretrained weight 로드)
     setup.init_model(
