@@ -425,10 +425,13 @@ def reduce_efficientvit_cls_model(model: nn.Module) -> nn.Module:
 def _load_state_dict_from_ckpt(path: str) -> dict[str, torch.Tensor]:
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     if isinstance(ckpt, dict):
-        for key in ("state_dict", "model", "ema"):
+        # EMA weights 우선: Soft Pruning 학습 중 raw network는 zeroed weights로 degraded되고
+        # EMA(shadows)가 실제 성능을 유지하므로, EMA가 있으면 반드시 우선 사용.
+        if "ema" in ckpt and isinstance(ckpt["ema"], dict) and "shadows" in ckpt["ema"]:
+            print("=> using EMA weights (shadows) from training checkpoint")
+            return ckpt["ema"]["shadows"]
+        for key in ("state_dict", "model"):
             if key in ckpt and isinstance(ckpt[key], dict):
-                if key == "ema" and "shadows" in ckpt[key]:
-                    return ckpt[key]["shadows"]
                 return ckpt[key]
     return ckpt
 

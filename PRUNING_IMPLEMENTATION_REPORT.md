@@ -987,28 +987,53 @@ CUDA_VISIBLE_DEVICES=7 torchrun --nproc_per_node=1 --master_port=12345 \
 --pruning_head_sparsity_scale 0.0
 ```
 
-### 9.3 학습 후 Reducing (B1, target=15% 예시)
+### 9.3 학습 후 Reducing + Eval (B1, target=15% 예시)
 
-fine-tune 완료 후 soft-pruned weight 를 실제 작은 dense 모델로 변환.
+fine-tune 완료 후 soft-pruned weight 를 실제 작은 dense 모델로 변환한 뒤 정확도를 측정한다.
+
+> **⚠️ `--save-full-model` 은 필수** — `eval_efficientvit_cls_model.py` 는 reduced state_dict 를
+> 로드하면 즉시 `ValueError` 로 종료된다(`compression_rate` 키 감지). 아키텍처가 달라졌기 때문에
+> state_dict 만으로는 모델을 재구성할 수 없어 모델 객체 자체를 저장해야 한다.
+
+**Step 1: Reducing**
 
 ```bash
+# target=15%
 python applications/efficientvit_cls/reduce_efficientvit_cls_model.py \
     --model efficientvit-b1 \
     --checkpoint /workspace/etri_iitp/JS/efficientvit2026/output/b1_prune15/checkpoint/model_best.pt \
-    --output    /workspace/etri_iitp/JS/efficientvit2026/output/b1_prune15/reduced_b1_15pct.pt
-```
+    --output    /workspace/etri_iitp/JS/efficientvit2026/output/b1_prune15/reduced_b1_15pct.pt \
+    --save-full-model
 
-target=20% 일 때:
-
-```bash
+# target=20%
 python applications/efficientvit_cls/reduce_efficientvit_cls_model.py \
     --model efficientvit-b1 \
     --checkpoint /workspace/etri_iitp/JS/efficientvit2026/output/b1_prune20/checkpoint/model_best.pt \
-    --output    /workspace/etri_iitp/JS/efficientvit2026/output/b1_prune20/reduced_b1_20pct.pt
+    --output    /workspace/etri_iitp/JS/efficientvit2026/output/b1_prune20/reduced_b1_20pct.pt \
+    --save-full-model
 ```
 
-옵션:
-- `--save-full-model`: state_dict 대신 모델 객체 자체 저장 (`torch.save(model)`).
+**Step 2: Eval**
+
+```bash
+CUDA_VISIBLE_DEVICES=7 python applications/efficientvit_cls/eval_efficientvit_cls_model.py \
+  --model efficientvit-b1 \
+  --weight_url /workspace/etri_iitp/JS/efficientvit2026/output/b1_prune15/reduced_b1_15pct.pt \
+  --path /workspace/etri_iitp/JS/efficientvit2026/data/imagenet/val \
+  --gpu 7 \
+  --batch_size 128 \
+  --wandb \
+  --wandb_project efficientvit-pruning \
+  --wandb_run_name b1_prune15_reduced_eval
+```
+
+> **훈련 중 Reducing 실행 시**: `model_best.pt` 를 복사한 뒤 복사본으로 작업하면 안전하다.
+> ```bash
+> cp .../checkpoint/model_best.pt .../checkpoint/model_best_snap.pt
+> # --checkpoint 를 model_best_snap.pt 로 변경하여 실행
+> ```
+
+기타 옵션:
 - `--input-size 224`, `--n-classes 1000`: forward 검증용 (B1 기본).
 
 ### 9.4 메모리 분해 측정 (`measure_memory.py`)
