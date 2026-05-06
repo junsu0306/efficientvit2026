@@ -427,9 +427,12 @@ def _load_state_dict_from_ckpt(path: str) -> dict[str, torch.Tensor]:
     if isinstance(ckpt, dict):
         # EMA weights 우선: Soft Pruning 학습 중 raw network는 zeroed weights로 degraded되고
         # EMA(shadows)가 실제 성능을 유지하므로, EMA가 있으면 반드시 우선 사용.
-        if "ema" in ckpt and isinstance(ckpt["ema"], dict) and "shadows" in ckpt["ema"]:
-            print("=> using EMA weights (shadows) from training checkpoint")
-            return ckpt["ema"]["shadows"]
+        # EMA.state_dict() 형식: {decay(float): shadows.state_dict()} — key가 float임에 주의.
+        if "ema" in ckpt and isinstance(ckpt["ema"], dict):
+            for v in ckpt["ema"].values():
+                if isinstance(v, dict):
+                    print("=> using EMA weights from training checkpoint")
+                    return v
         for key in ("state_dict", "model"):
             if key in ckpt and isinstance(ckpt[key], dict):
                 return ckpt[key]

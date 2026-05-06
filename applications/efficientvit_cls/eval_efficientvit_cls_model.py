@@ -91,18 +91,23 @@ def main():
                 "Reduced state_dict detected. Re-run reduce script with --save-full-model "
                 "to embed the architecture, then point --weight_url to the new file."
             )
-        elif isinstance(raw, dict) and "ema" in raw and isinstance(raw["ema"], dict) and "shadows" in raw["ema"]:
+        elif isinstance(raw, dict) and "ema" in raw and isinstance(raw["ema"], dict):
             # Training checkpoint with EMA: raw network weights are degraded by Soft Pruning
             # (zeroed channels), so always prefer EMA shadows which reflect actual val accuracy.
-            print(f"=> using EMA weights (shadows) from training checkpoint {args.weight_url}")
-            model = create_efficientvit_cls_model(args.model, pretrained=False)
-            sd = {(k[len("module."):] if k.startswith("module.") else k): v
-                  for k, v in raw["ema"]["shadows"].items()}
-            missing, unexpected = model.load_state_dict(sd, strict=False)
-            if missing:
-                print(f"[warn] missing keys: {len(missing)}")
-            if unexpected:
-                print(f"[warn] unexpected keys: {len(unexpected)}")
+            # EMA.state_dict() format: {decay(float): shadows.state_dict()} — key is a float.
+            ema_sd = next((v for v in raw["ema"].values() if isinstance(v, dict)), None)
+            if ema_sd is not None:
+                print(f"=> using EMA weights from training checkpoint {args.weight_url}")
+                model = create_efficientvit_cls_model(args.model, pretrained=False)
+                sd = {(k[len("module."):] if k.startswith("module.") else k): v
+                      for k, v in ema_sd.items()}
+                missing, unexpected = model.load_state_dict(sd, strict=False)
+                if missing:
+                    print(f"[warn] missing keys: {len(missing)}")
+                if unexpected:
+                    print(f"[warn] unexpected keys: {len(unexpected)}")
+            else:
+                model = create_efficientvit_cls_model(args.model, weight_url=args.weight_url)
         else:
             model = create_efficientvit_cls_model(args.model, weight_url=args.weight_url)
     else:
