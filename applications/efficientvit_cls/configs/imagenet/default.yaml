@@ -21,7 +21,7 @@ data_provider:
 
 run_config:
   n_epochs: 45
-  base_lr: 0.00025
+  base_lr: 0.00015
   warmup_epochs: 5
   warmup_lr: 1.0e-06
   lr_schedule_name: cosine
