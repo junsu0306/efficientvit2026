@@ -19,17 +19,19 @@ def main():
     parser.add_argument("--export_path", type=str)
     parser.add_argument("--task", type=str, default="cls", choices=["cls", "seg"])
     parser.add_argument("--model", type=str, default="efficientvit-l2")
+    parser.add_argument("--weight_url", type=str, default=None)
     parser.add_argument("--resolution", type=int, nargs="+", default=224)
     parser.add_argument("--bs", help="batch size", type=int, default=16)
     parser.add_argument("--op_set", type=int, default=11)
 
     args = parser.parse_args()
 
+    pretrained = args.weight_url is not None
     resolution = val2tuple(args.resolution, 2)
     if args.task == "cls":
-        model = create_efficientvit_cls_model(name=args.model, pretrained=False)
+        model = create_efficientvit_cls_model(name=args.model, pretrained=pretrained, weight_url=args.weight_url)
     elif args.task == "seg":
-        model = create_efficientvit_seg_model(name=args.model, pretrained=False)
+        model = create_efficientvit_seg_model(name=args.model, pretrained=pretrained, weight_url=args.weight_url)
     else:
         raise NotImplementedError
 
