@@ -1455,15 +1455,22 @@ full model 버전 = "구조까지 포함된 완성된 파일" → 바로 열어�
 
 ### 개요
 
-학습된 `.pt` 체크포인트를 ONNX 포맷으로 변환한다.  
-변환 스크립트: `efficientvit/assets/onnx_export.py`
+학습된 `.pt` 체크포인트를 ONNX 포맷으로 변환한 뒤, Mobilint NPU 컴파일러용으로 입력 포맷을 NHWC로 변환하는 두 단계로 구성된다.
 
-기본 스크립트는 `pretrained=False`(랜덤 가중치)로 동작하므로,  
-학습된 가중치를 포함하려면 `--weight_url` 인자를 추가로 사용해야 한다.
+| 스크립트 | 역할 |
+|----------|------|
+| `efficientvit/assets/onnx_export.py` | `.pt` → `.onnx` 변환 (NCHW 입력) |
+| `efficientvit/assets/onnx_nhwc_convert.py` | ONNX 입력을 NCHW → NHWC로 변환 |
 
-> **NPU 배포 시 opset 주의**  
-> Opset 11은 EfficientViT에 자주 쓰이는 HardSwish 계열 활성화 함수를 단일 노드로 지원하지 않는다.  
-> NPU에서 실행할 경우 **opset 13 이상** 사용을 권장한다.
+> **opset 13 사용 이유**  
+> Opset 11은 EfficientViT에 쓰이는 HardSwish 계열 활성화 함수를 단일 노드로 지원하지 않는다.  
+> NPU 배포 시 **opset 13 이상** 사용을 권장한다.
+
+> **NHWC 변환 이유 (Mobilint NPU)**  
+> Mobilint 컴파일러는 4D 입력을 무조건 NHWC로 간주한다.  
+> PyTorch 기본 출력인 NCHW `(1,3,224,224)` 를 그대로 넣으면 컴파일러가 C=224로 해석해  
+> 양자화 zeropoint가 오버플로우(`zeropoint=-2147483648`)된다.  
+> ONNX 앞에 Transpose 노드를 삽입해 입력을 NHWC `(1,224,224,3)` 로 만들어야 한다.
 
 ### 실행 환경 설정
 
@@ -1477,27 +1484,41 @@ export PYTHONPATH=/workspace/etri_iitp/JS/efficientvit2026
 
 **B0 모델**
 ```bash
+# Step 1: ONNX 추출
 PYTHONPATH=/workspace/etri_iitp/JS/efficientvit2026 python efficientvit/assets/onnx_export.py \
-  --export_path assets/export_models/efficientvit_b0_r224_opset13.onnx \
+  --export_path assets/export_models/efficientvit_b0_r224.onnx \
   --model efficientvit-b0 \
   --weight_url assets/checkpoints/efficientvit_cls/efficientvit_b0_r224.pt \
   --resolution 224 224 \
   --bs 1 \
   --op_set 13
+
+# Step 2: NHWC 변환 (Mobilint NPU용)
+python efficientvit/assets/onnx_nhwc_convert.py \
+  --input  assets/export_models/efficientvit_b0_r224.onnx \
+  --output assets/export_models/efficientvit_b0_r224_nhwc.onnx
 ```
 
 **B1 모델**
 ```bash
+# Step 1: ONNX 추출
 PYTHONPATH=/workspace/etri_iitp/JS/efficientvit2026 python efficientvit/assets/onnx_export.py \
-  --export_path assets/export_models/efficientvit_b1_r224_opset13.onnx \
+  --export_path assets/export_models/efficientvit_b1_r224.onnx \
   --model efficientvit-b1 \
   --weight_url assets/checkpoints/efficientvit_cls/efficientvit_b1_r224.pt \
   --resolution 224 224 \
   --bs 1 \
   --op_set 13
+
+# Step 2: NHWC 변환 (Mobilint NPU용)
+python efficientvit/assets/onnx_nhwc_convert.py \
+  --input  assets/export_models/efficientvit_b1_r224.onnx \
+  --output assets/export_models/efficientvit_b1_r224_nhwc.onnx
 ```
 
 ### 주요 인자
+
+**onnx_export.py**
 
 | 인자 | 설명 |
 |------|------|
@@ -1506,12 +1527,21 @@ PYTHONPATH=/workspace/etri_iitp/JS/efficientvit2026 python efficientvit/assets/o
 | `--weight_url` | 로드할 `.pt` 체크포인트 경로 (생략 시 랜덤 가중치) |
 | `--resolution` | 입력 해상도 (예: `224 224`) |
 | `--bs` | 배치 사이즈 |
-| `--op_set` | ONNX opset 버전 (기본값: 11) |
+| `--op_set` | ONNX opset 버전 (기본값: 11, NPU용 13 권장) |
 | `--task` | `cls` 또는 `seg` (기본값: `cls`) |
+
+**onnx_nhwc_convert.py**
+
+| 인자 | 설명 |
+|------|------|
+| `--input` | 변환할 ONNX 파일 경로 (NCHW 입력) |
+| `--output` | 저장할 ONNX 파일 경로 (NHWC 입력) |
 
 ### 출력 파일
 
-| 파일 | 체크포인트 | opset |
-|------|-----------|-------|
-| `assets/export_models/efficientvit_b0_r224_opset13.onnx` | `assets/checkpoints/efficientvit_cls/efficientvit_b0_r224.pt` | 13 |
-| `assets/export_models/efficientvit_b1_r224_opset13.onnx` | `assets/checkpoints/efficientvit_cls/efficientvit_b1_r224.pt` | 13 |
+| 파일 | 용도 |
+|------|------|
+| `assets/export_models/efficientvit_b0_r224.onnx` | 일반 ONNX (NCHW) |
+| `assets/export_models/efficientvit_b0_r224_nhwc.onnx` | Mobilint NPU 컴파일러용 (NHWC) |
+| `assets/export_models/efficientvit_b1_r224.onnx` | 일반 ONNX (NCHW) |
+| `assets/export_models/efficientvit_b1_r224_nhwc.onnx` | Mobilint NPU 컴파일러용 (NHWC) |
