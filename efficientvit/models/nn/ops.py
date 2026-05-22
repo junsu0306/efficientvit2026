@@ -872,7 +872,7 @@ class LiteMLA(nn.Module):
         q, k, v = (
             qkv[:, :, 0 : self.dim],
             qkv[:, :, self.dim : 2 * self.dim],
-            qkv[:, :, 2 * self.dim :],
+            qkv[:, :, 2 * self.dim : 3 * self.dim],
         )
 
         # 선형 어텐션의 커널 φ(·) 적용. 기본 ReLU.
@@ -924,7 +924,7 @@ class LiteMLA(nn.Module):
         q, k, v = (
             qkv[:, :, 0 : self.dim],
             qkv[:, :, self.dim : 2 * self.dim],
-            qkv[:, :, 2 * self.dim :],
+            qkv[:, :, 2 * self.dim : 3 * self.dim],
         )
 
         q = self.kernel_func(q)
