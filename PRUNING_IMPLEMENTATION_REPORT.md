@@ -1448,3 +1448,70 @@ reduced_b1_30pct.pt	reduced_b1_30pct_full.pt
 
 state_dict 버전 = "숫자 데이터만 담긴 엑셀 파일" → 어디 칸에 넣을지 테이블 구조를 따로 알아야 함
 full model 버전 = "구조까지 포함된 완성된 파일" → 바로 열어서 사용 가능
+
+---
+
+## ONNX 변환
+
+### 개요
+
+학습된 `.pt` 체크포인트를 ONNX 포맷으로 변환한다.  
+변환 스크립트: `efficientvit/assets/onnx_export.py`
+
+기본 스크립트는 `pretrained=False`(랜덤 가중치)로 동작하므로,  
+학습된 가중치를 포함하려면 `--weight_url` 인자를 추가로 사용해야 한다.
+
+> **NPU 배포 시 opset 주의**  
+> Opset 11은 EfficientViT에 자주 쓰이는 HardSwish 계열 활성화 함수를 단일 노드로 지원하지 않는다.  
+> NPU에서 실행할 경우 **opset 13 이상** 사용을 권장한다.
+
+### 실행 환경 설정
+
+스크립트가 `efficientvit` 패키지를 인식하려면 `PYTHONPATH`를 프로젝트 루트로 설정해야 한다:
+
+```bash
+export PYTHONPATH=/workspace/etri_iitp/JS/efficientvit2026
+```
+
+### 변환 명령어
+
+**B0 모델**
+```bash
+PYTHONPATH=/workspace/etri_iitp/JS/efficientvit2026 python efficientvit/assets/onnx_export.py \
+  --export_path assets/export_models/efficientvit_b0_r224_opset13.onnx \
+  --model efficientvit-b0 \
+  --weight_url assets/checkpoints/efficientvit_cls/efficientvit_b0_r224.pt \
+  --resolution 224 224 \
+  --bs 1 \
+  --op_set 13
+```
+
+**B1 모델**
+```bash
+PYTHONPATH=/workspace/etri_iitp/JS/efficientvit2026 python efficientvit/assets/onnx_export.py \
+  --export_path assets/export_models/efficientvit_b1_r224_opset13.onnx \
+  --model efficientvit-b1 \
+  --weight_url assets/checkpoints/efficientvit_cls/efficientvit_b1_r224.pt \
+  --resolution 224 224 \
+  --bs 1 \
+  --op_set 13
+```
+
+### 주요 인자
+
+| 인자 | 설명 |
+|------|------|
+| `--export_path` | 출력 ONNX 파일 경로 |
+| `--model` | 모델 이름 (예: `efficientvit-b0`, `efficientvit-b1`) |
+| `--weight_url` | 로드할 `.pt` 체크포인트 경로 (생략 시 랜덤 가중치) |
+| `--resolution` | 입력 해상도 (예: `224 224`) |
+| `--bs` | 배치 사이즈 |
+| `--op_set` | ONNX opset 버전 (기본값: 11) |
+| `--task` | `cls` 또는 `seg` (기본값: `cls`) |
+
+### 출력 파일
+
+| 파일 | 체크포인트 | opset |
+|------|-----------|-------|
+| `assets/export_models/efficientvit_b0_r224_opset13.onnx` | `assets/checkpoints/efficientvit_cls/efficientvit_b0_r224.pt` | 13 |
+| `assets/export_models/efficientvit_b1_r224_opset13.onnx` | `assets/checkpoints/efficientvit_cls/efficientvit_b1_r224.pt` | 13 |
