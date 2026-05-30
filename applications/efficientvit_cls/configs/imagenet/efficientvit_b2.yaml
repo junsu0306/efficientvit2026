@@ -1,5 +1,5 @@
 data_provider:
-  base_batch_size: 32
+  base_batch_size: 64
 
 net_config:
   name: efficientvit-b2
