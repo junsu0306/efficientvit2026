@@ -14,11 +14,18 @@ Prunable 그룹:
 
 Non-prunable (외부 채널과 직결되어 건드리지 않음):
   - LiteMLA (multi-scale aggreg 와 결합도가 높아 제외)
-  - ClsHead (정확도 보존을 위해 제외)
   - Stage 사이 채널 경계 (width_list[1..4])
+
+성능 최적화:
+  - init 시 모든 prunable 텐서 레퍼런스를 _PruneGroup 으로 수집 (매 step model.modules() 순회 제거).
+  - 인덱스 캐싱: 기본 100 step 마다만 topk 재계산 (index_refresh_steps).
+  - weight *= mask 벡터화: fancy-index scatter 대신 단일 elementwise mul (CUDA 커널 수 감소).
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
@@ -41,8 +48,12 @@ __all__ = ["EfficientViTPruner"]
 MIN_SURVIVE = 4
 
 
+# ---------------------------------------------------------------------------
+# 기본 수치 헬퍼
+# ---------------------------------------------------------------------------
+
+
 def _bn_param_count(bn: nn.Module | None) -> int:
-    """BN(혹은 LN) 의 학습 파라미터 수 (running stat 제외, weight + bias)."""
     if bn is None:
         return 0
     n = 0
@@ -67,8 +78,216 @@ def _calc_n_prune(n_total: int, sparsity: float) -> int:
     return max(n_prune, 0)
 
 
+def _topk_smallest_l2_idx(weight: torch.Tensor, k: int) -> torch.Tensor:
+    """첫 차원(필터 축) L2 norm 이 가장 작은 k 개의 인덱스."""
+    n = weight.shape[0]
+    norms = torch.norm(weight.detach().reshape(n, -1), dim=1)
+    _, idx = torch.topk(norms, k, largest=False)
+    return idx
+
+
+# ---------------------------------------------------------------------------
+# _PruneGroup: 단일 prunable 그룹의 텐서 레퍼런스 + 마스크 캐시
+#
+# 설계 원칙:
+#   - criterion : L2 norm ranking 에 쓰이는 기준 weight (inverted_conv 또는 spatial_conv).
+#   - targets   : 마스킹 대상 (tensor, dim, fill_value) 튜플 리스트.
+#                 fill_value=0.0 → 0 으로 덮어쓰기, =1.0 → pruned 채널만 1 로 (running_var 용).
+#   - _mask     : (n,) float32 GPU tensor. 1=alive, 0=pruned. None 이면 아직 미계산.
+#
+# apply() 내부에서 tensor *= mask 로 처리하므로 Python-level 루프가 없고
+# CUDA 커널 수가 대폭 줄어든다.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _PruneGroup:
+    criterion: torch.Tensor                    # (n_filters, ...) — ranking 기준
+    sparsity: float
+    targets: List[Tuple[torch.Tensor, int, float]]  # (tensor, dim, fill)
+    _mask: torch.Tensor | None = field(default=None, repr=False)
+
+    def refresh(self) -> None:
+        """topk 로 인덱스를 재계산하고 마스크를 갱신한다."""
+        n = self.criterion.shape[0]
+        n_prune = _calc_n_prune(n, self.sparsity)
+        mask = torch.ones(n, dtype=torch.float32, device=self.criterion.device)
+        if n_prune > 0:
+            norms = torch.norm(self.criterion.detach().reshape(n, -1), dim=1)
+            _, idx = torch.topk(norms, n_prune, largest=False)
+            mask[idx] = 0.0
+        self._mask = mask
+
+    @torch.no_grad()
+    def apply(self) -> None:
+        """캐시된 마스크로 모든 대상 텐서를 벡터화하여 마스킹한다."""
+        if self._mask is None:
+            return
+        mask = self._mask  # (n,)
+        for tensor, dim, fill in self.targets:
+            if tensor is None:
+                continue
+            # mask 를 tensor 차원에 맞게 브로드캐스트.
+            shape = [1] * tensor.dim()
+            shape[dim] = -1
+            m = mask.view(shape)
+            if fill == 0.0:
+                tensor.data.mul_(m)
+            else:
+                # pruned 채널 → fill, alive 채널 → 현재 값 유지.
+                # tensor = tensor * mask + fill * (1 - mask)
+                tensor.data.mul_(m).add_(fill * (1.0 - m))
+
+
+# ---------------------------------------------------------------------------
+# 그룹 수집 헬퍼 — init 시 1회만 실행
+# ---------------------------------------------------------------------------
+
+
+def _targets_from_bn(bn: nn.Module | None, fill_mean: float = 0.0) -> list:
+    """BN/LN 의 weight, bias, running_mean, running_var 를 타겟 리스트로 반환."""
+    out = []
+    if bn is None:
+        return out
+    if getattr(bn, "weight", None) is not None:
+        out.append((bn.weight, 0, 0.0))
+    if getattr(bn, "bias", None) is not None:
+        out.append((bn.bias, 0, 0.0))
+    if isinstance(bn, _BatchNorm):
+        out.append((bn.running_mean, 0, 0.0))
+        out.append((bn.running_var, 0, 1.0))  # div-by-zero 방지: pruned → 1.0
+    return out
+
+
+def _collect_mbconv_group(mb: MBConv, sparsity: float) -> _PruneGroup:
+    targets = []
+    inv = mb.inverted_conv
+    targets.append((inv.conv.weight, 0, 0.0))
+    if inv.conv.bias is not None:
+        targets.append((inv.conv.bias, 0, 0.0))
+    targets.extend(_targets_from_bn(inv.norm))
+
+    dw = mb.depth_conv
+    targets.append((dw.conv.weight, 0, 0.0))
+    if dw.conv.bias is not None:
+        targets.append((dw.conv.bias, 0, 0.0))
+    targets.extend(_targets_from_bn(dw.norm))
+
+    # point_conv: 입력 컬럼 (dim=1)
+    targets.append((mb.point_conv.conv.weight, 1, 0.0))
+
+    return _PruneGroup(criterion=inv.conv.weight, sparsity=sparsity, targets=targets)
+
+
+def _collect_fusedmbconv_group(fmb: FusedMBConv, sparsity: float) -> _PruneGroup:
+    targets = []
+    sp = fmb.spatial_conv
+    targets.append((sp.conv.weight, 0, 0.0))
+    if sp.conv.bias is not None:
+        targets.append((sp.conv.bias, 0, 0.0))
+    targets.extend(_targets_from_bn(sp.norm))
+
+    targets.append((fmb.point_conv.conv.weight, 1, 0.0))
+
+    return _PruneGroup(criterion=sp.conv.weight, sparsity=sparsity, targets=targets)
+
+
+def _collect_stem_groups(model: nn.Module, sparsity: float) -> list[_PruneGroup]:
+    """Stem chain 전체를 단일 criterion(stem[0].conv.weight) 으로 묶어 반환."""
+    stem = _get_stem_op_seq(model)
+    if stem is None or not hasattr(stem, "op_list") or len(stem.op_list) == 0:
+        return []
+    first_cl = stem.op_list[0]
+    if not isinstance(first_cl, ConvLayer):
+        return []
+
+    criterion = first_cl.conv.weight  # (C0, 3, k, k)
+    targets = []
+
+    # stem[0]: 출력 필터 (dim=0)
+    targets.append((first_cl.conv.weight, 0, 0.0))
+    if first_cl.conv.bias is not None:
+        targets.append((first_cl.conv.bias, 0, 0.0))
+    targets.extend(_targets_from_bn(first_cl.norm))
+
+    # stem[1..]: inner DSConv / ResBlock
+    for inner in _iter_stem_inner_blocks(stem):
+        if isinstance(inner, DSConv):
+            dw = inner.depth_conv
+            targets.append((dw.conv.weight, 0, 0.0))
+            if dw.conv.bias is not None:
+                targets.append((dw.conv.bias, 0, 0.0))
+            targets.extend(_targets_from_bn(dw.norm))
+
+            pw = inner.point_conv
+            targets.append((pw.conv.weight, 0, 0.0))  # 출력 필터
+            targets.append((pw.conv.weight, 1, 0.0))  # 입력 컬럼 (양방향)
+            if pw.conv.bias is not None:
+                targets.append((pw.conv.bias, 0, 0.0))
+            targets.extend(_targets_from_bn(pw.norm))
+        else:  # ResBlock
+            for cl in (inner.conv1, inner.conv2):
+                targets.append((cl.conv.weight, 0, 0.0))
+                targets.append((cl.conv.weight, 1, 0.0))
+                if cl.conv.bias is not None:
+                    targets.append((cl.conv.bias, 0, 0.0))
+                targets.extend(_targets_from_bn(cl.norm))
+
+    # 다음 stage 첫 conv 입력 컬럼 (dim=1)
+    post = _get_post_stem_first_conv(model)
+    if post is not None:
+        targets.append((post.conv.weight, 1, 0.0))
+
+    return [_PruneGroup(criterion=criterion, sparsity=sparsity, targets=targets)]
+
+
+def _collect_head_groups(model: nn.Module, head_sparsity: float) -> list[_PruneGroup]:
+    """G_HEAD0, G_HEAD1 을 각각 _PruneGroup 으로 수집한다."""
+    if not _has_prunable_head(model):
+        return []
+    head = model.head  # type: ignore[attr-defined]
+    groups = []
+
+    # G_HEAD0: op_list[0] Conv 출력 필터 → op_list[2] Linear 입력 컬럼
+    conv0_w = head.op_list[0].conv.weight  # (w0, in_ch, 1, 1)
+    n_prune0 = _calc_n_prune(conv0_w.shape[0], head_sparsity)
+    if n_prune0 > 0:
+        t0 = []
+        t0.append((conv0_w, 0, 0.0))
+        if head.op_list[0].conv.bias is not None:
+            t0.append((head.op_list[0].conv.bias, 0, 0.0))
+        t0.extend(_targets_from_bn(head.op_list[0].norm))
+        t0.append((head.op_list[2].linear.weight, 1, 0.0))  # Linear 입력 컬럼
+        groups.append(_PruneGroup(criterion=conv0_w, sparsity=head_sparsity, targets=t0))
+
+    # G_HEAD1: op_list[2] Linear 출력 행 → op_list[3] Linear 입력 컬럼
+    lin2_w = head.op_list[2].linear.weight  # (w1, w0)
+    effective_sp = min(head_sparsity, _HEAD1_MAX_SPARSITY)
+    n_prune1 = _calc_n_prune(lin2_w.shape[0], effective_sp)
+    if n_prune1 > 0:
+        t1 = []
+        t1.append((lin2_w, 0, 0.0))
+        if head.op_list[2].linear.bias is not None:
+            t1.append((head.op_list[2].linear.bias, 0, 0.0))
+        # LayerNorm (running stats 없음, weight/bias 만)
+        ln = head.op_list[2].norm
+        if ln is not None:
+            if getattr(ln, "weight", None) is not None:
+                t1.append((ln.weight, 0, 0.0))
+            if getattr(ln, "bias", None) is not None:
+                t1.append((ln.bias, 0, 0.0))
+        t1.append((head.op_list[3].linear.weight, 1, 0.0))  # Linear 입력 컬럼
+        groups.append(_PruneGroup(criterion=lin2_w, sparsity=effective_sp, targets=t1))
+
+    return groups
+
+
+# ---------------------------------------------------------------------------
+# log_sparsity / 이진탐색에 여전히 필요한 구버전 인터페이스 (변경 없음)
+# ---------------------------------------------------------------------------
+
+
 def _zero_bn_(bn: nn.Module | None, idx: torch.Tensor) -> None:
-    """BN 의 idx 채널들을 안전 마스킹 (running_var 는 1.0 로 — 분모 0 방지)."""
     if bn is None:
         return
     with torch.no_grad():
@@ -81,90 +300,57 @@ def _zero_bn_(bn: nn.Module | None, idx: torch.Tensor) -> None:
             bn.running_var.data[idx] = 1.0
 
 
-def _topk_smallest_l2_idx(weight: torch.Tensor, k: int) -> torch.Tensor:
-    """첫 차원(필터 축) L2 norm 이 가장 작은 k 개의 인덱스."""
-    n = weight.shape[0]
-    norms = torch.norm(weight.detach().reshape(n, -1), dim=1)
-    _, idx = torch.topk(norms, k, largest=False)
-    return idx
-
-
-# ---------------------------------------------------------------------------
-# Prunable 그룹 단위 1) 마스킹  2) 제거 파라미터 추정 함수.
-# 두 함수는 항상 동일한 sparsity 가 같은 인덱스 / 같은 제거량을 만들도록 짝지어 둔다.
-# ---------------------------------------------------------------------------
-
-
 def _prune_mbconv(mb: MBConv, sparsity: float) -> None:
-    """MBConv mid_channels(=inverted_conv 출력) 을 sparsity 비율로 마스킹."""
-    weight = mb.inverted_conv.conv.weight  # (mid, in, 1, 1)
+    weight = mb.inverted_conv.conv.weight
     mid = weight.shape[0]
     n_prune = _calc_n_prune(mid, sparsity)
     if n_prune <= 0:
         return
     idx = _topk_smallest_l2_idx(weight, n_prune)
-
     with torch.no_grad():
-        # inverted_conv: 출력 필터 마스킹.
         mb.inverted_conv.conv.weight.data[idx] = 0.0
         if mb.inverted_conv.conv.bias is not None:
             mb.inverted_conv.conv.bias.data[idx] = 0.0
         _zero_bn_(mb.inverted_conv.norm, idx)
-
-        # depth_conv: groups=mid 이므로 동일 인덱스가 그대로 채널/그룹 인덱스.
         mb.depth_conv.conv.weight.data[idx] = 0.0
         if mb.depth_conv.conv.bias is not None:
             mb.depth_conv.conv.bias.data[idx] = 0.0
         _zero_bn_(mb.depth_conv.norm, idx)
-
-        # point_conv: 입력 컬럼(=mid 축) 마스킹. 출력은 외부 채널이라 건드리지 않음.
         mb.point_conv.conv.weight.data[:, idx] = 0.0
 
 
 def _prune_fusedmbconv(fmb: FusedMBConv, sparsity: float) -> None:
-    """FusedMBConv mid_channels(=spatial_conv 출력) 을 sparsity 비율로 마스킹."""
-    weight = fmb.spatial_conv.conv.weight  # (mid, in/groups, k, k)
+    weight = fmb.spatial_conv.conv.weight
     mid = weight.shape[0]
     n_prune = _calc_n_prune(mid, sparsity)
     if n_prune <= 0:
         return
     idx = _topk_smallest_l2_idx(weight, n_prune)
-
     with torch.no_grad():
         fmb.spatial_conv.conv.weight.data[idx] = 0.0
         if fmb.spatial_conv.conv.bias is not None:
             fmb.spatial_conv.conv.bias.data[idx] = 0.0
         _zero_bn_(fmb.spatial_conv.norm, idx)
-
-        # point_conv 입력 컬럼.
         fmb.point_conv.conv.weight.data[:, idx] = 0.0
 
 
 def _estimate_removed_mbconv(mb: MBConv, sparsity: float) -> int:
-    """sparsity 적용 시 MBConv 에서 제거되는 파라미터 수 (이차 효과 반영)."""
     weight = mb.inverted_conv.conv.weight
     mid, in_ch = weight.shape[0], weight.shape[1]
     out_ch = mb.point_conv.conv.weight.shape[0]
     k = mb.depth_conv.conv.weight.shape[-1]
-
     n_prune = _calc_n_prune(mid, sparsity)
     if n_prune <= 0:
         return 0
-
     removed = 0
-    # inverted_conv: 출력 필터 → (in_ch * 1 * 1) 만큼씩 사라짐 + (옵션) bias.
     removed += n_prune * in_ch
     if mb.inverted_conv.conv.bias is not None:
         removed += n_prune
     removed += n_prune * (1 if isinstance(mb.inverted_conv.norm, _BatchNorm) else 0) * 2
-
-    # depth_conv: groups=mid 이므로 채널 1개 = (1 * k * k) 만큼.
     removed += n_prune * k * k
     if mb.depth_conv.conv.bias is not None:
         removed += n_prune
     removed += n_prune * (1 if isinstance(mb.depth_conv.norm, _BatchNorm) else 0) * 2
-
-    # point_conv: 입력 컬럼 → out_ch 개의 슬롯을 잃음.
     removed += out_ch * n_prune
     return removed
 
@@ -174,28 +360,24 @@ def _estimate_removed_fusedmbconv(fmb: FusedMBConv, sparsity: float) -> int:
     mid, in_per_group = weight.shape[0], weight.shape[1]
     k = weight.shape[-1]
     out_ch = fmb.point_conv.conv.weight.shape[0]
-
     n_prune = _calc_n_prune(mid, sparsity)
     if n_prune <= 0:
         return 0
-
     removed = 0
     removed += n_prune * in_per_group * k * k
     if fmb.spatial_conv.conv.bias is not None:
         removed += n_prune
     removed += n_prune * (1 if isinstance(fmb.spatial_conv.norm, _BatchNorm) else 0) * 2
-
     removed += out_ch * n_prune
     return removed
 
 
 # ---------------------------------------------------------------------------
-# Input Stem (stage0) — chain pruning
+# Input Stem 유틸 (이진탐색 + log_sparsity + collect 공용)
 # ---------------------------------------------------------------------------
 
 
 def _zero_conv_out_filters_(cl: ConvLayer, idx: torch.Tensor) -> None:
-    """ConvLayer 출력 필터 + BN 채널을 한 번에 마스킹."""
     with torch.no_grad():
         cl.conv.weight.data[idx] = 0.0
         if cl.conv.bias is not None:
@@ -204,13 +386,11 @@ def _zero_conv_out_filters_(cl: ConvLayer, idx: torch.Tensor) -> None:
 
 
 def _zero_conv_in_cols_(cl: ConvLayer, idx: torch.Tensor) -> None:
-    """ConvLayer 입력 컬럼만 마스킹 (출력 채널/BN 은 손대지 않음)."""
     with torch.no_grad():
         cl.conv.weight.data[:, idx] = 0.0
 
 
 def _get_stem_op_seq(model: nn.Module) -> OpSequential | None:
-    """B-series 의 input_stem 또는 L-series 의 stages[0] 을 반환. 없으면 None."""
     bb = getattr(model, "backbone", None)
     if bb is None:
         return None
@@ -222,23 +402,16 @@ def _get_stem_op_seq(model: nn.Module) -> OpSequential | None:
 
 
 def _get_post_stem_first_conv(model: nn.Module) -> ConvLayer | None:
-    """Stem 직후 첫 stage 의 첫 down-sampling 블록의 첫 ConvLayer 를 반환.
-
-    이 ConvLayer 의 입력 컬럼이 stem 출력 채널과 직결되므로,
-    stem chain 마스킹 시 함께 입력 컬럼을 마스킹해야 한다.
-    """
     bb = getattr(model, "backbone", None)
     if bb is None or not hasattr(bb, "stages") or len(bb.stages) == 0:
         return None
-    # B-series: input_stem 이 따로 있으므로 stages[0] 가 stage1.
-    # L-series: stages[0] 이 stem 이므로 stages[1] 가 stage1.
     stage1_idx = 0 if hasattr(bb, "input_stem") else 1
     if stage1_idx >= len(bb.stages):
         return None
     stage1 = bb.stages[stage1_idx]
     if not hasattr(stage1, "op_list") or len(stage1.op_list) == 0:
         return None
-    first = stage1.op_list[0]  # ResidualBlock(MBConv|FusedMBConv, shortcut=None)
+    first = stage1.op_list[0]
     main = getattr(first, "main", first)
     if isinstance(main, MBConv):
         return main.inverted_conv
@@ -248,9 +421,6 @@ def _get_post_stem_first_conv(model: nn.Module) -> ConvLayer | None:
 
 
 def _iter_stem_inner_blocks(stem: OpSequential):
-    """Stem 의 op_list[1..] 가 ResidualBlock(DSConv|ResBlock, Identity) 일 때
-    내부의 (DSConv | ResBlock) 만 순회한다.
-    """
     for op in stem.op_list[1:]:
         main = getattr(op, "main", op)
         if isinstance(main, (DSConv, ResBlock)):
@@ -258,70 +428,41 @@ def _iter_stem_inner_blocks(stem: OpSequential):
 
 
 def _prune_input_stem(model: nn.Module, sparsity: float) -> None:
-    """Stem chain (input_stem 또는 stages[0]) 을 single-index 로 마스킹.
-
-    구조:
-      stem.op_list[0] = ConvLayer(3 → C0)                 ← 출력 필터 = C0
-      stem.op_list[1..] = ResidualBlock(DSConv|ResBlock, Identity)
-        DSConv:    .depth_conv (groups=C0) + .point_conv (in=out=C0)
-        ResBlock:  .conv1 (in=out=C0)     + .conv2 (in=out=C0)
-      이후 stage1 의 첫 down-sampling Conv 입력 컬럼 (C0) 도 동기화.
-    """
     stem = _get_stem_op_seq(model)
     if stem is None or not hasattr(stem, "op_list") or len(stem.op_list) == 0:
         return
     first_cl = stem.op_list[0]
     if not isinstance(first_cl, ConvLayer):
         return
-
-    weight = first_cl.conv.weight  # (C0, 3, k, k)
+    weight = first_cl.conv.weight
     n_total = weight.shape[0]
     n_prune = _calc_n_prune(n_total, sparsity)
     if n_prune <= 0:
         return
     idx = _topk_smallest_l2_idx(weight, n_prune)
-
-    # stem[0]: 출력 필터.
     _zero_conv_out_filters_(first_cl, idx)
-
-    # stem[1..]: 각 inner DSConv/ResBlock 은 in==out==C0 라 양방향 동기화.
     for inner in _iter_stem_inner_blocks(stem):
         if isinstance(inner, DSConv):
-            # depth_conv: groups=C0 → 같은 idx 가 채널 = 그룹 인덱스.
             _zero_conv_out_filters_(inner.depth_conv, idx)
-            # point_conv: in / out 둘 다 C0.
             _zero_conv_out_filters_(inner.point_conv, idx)
             _zero_conv_in_cols_(inner.point_conv, idx)
-        else:  # ResBlock
+        else:
             _zero_conv_out_filters_(inner.conv1, idx)
             _zero_conv_in_cols_(inner.conv1, idx)
             _zero_conv_out_filters_(inner.conv2, idx)
             _zero_conv_in_cols_(inner.conv2, idx)
-
-    # stem 출력 채널 → 다음 stage 첫 down-sampling Conv 입력 컬럼 동기화.
     post = _get_post_stem_first_conv(model)
     if post is not None:
         _zero_conv_in_cols_(post, idx)
 
 
 def _estimate_removed_input_stem(model: nn.Module, sparsity: float) -> int:
-    """Stem chain pruning 시 제거되는 파라미터 수 (이차 효과 포함).
-
-    포함 항목:
-      - stem[0]: out filter * (3 * k * k) + BN
-      - 각 DSConv/ResBlock:
-          DSConv:   depth_conv (k×k, groups=C0) + point_conv (in=out=C0, 양방향)
-          ResBlock: conv1 (in=out=C0, 양방향)   + conv2 (in=out=C0, 양방향)
-      - 다음 stage 첫 conv 의 입력 컬럼: n_C0 * out_ch_first
-        (n_C0 * n_mid 만큼의 cross-term 은 무시 → 약간의 over-estimate, 안전 방향)
-    """
     stem = _get_stem_op_seq(model)
     if stem is None or not hasattr(stem, "op_list") or len(stem.op_list) == 0:
         return 0
     first_cl = stem.op_list[0]
     if not isinstance(first_cl, ConvLayer):
         return 0
-
     weight = first_cl.conv.weight
     n_total, in_ch_image = weight.shape[0], weight.shape[1]
     k0 = weight.shape[-1]
@@ -329,35 +470,28 @@ def _estimate_removed_input_stem(model: nn.Module, sparsity: float) -> int:
     if n_prune <= 0:
         return 0
     n_surv = n_total - n_prune
-
     removed = 0
-    # stem[0] out filter.
     removed += n_prune * in_ch_image * k0 * k0
     if first_cl.conv.bias is not None:
         removed += n_prune
     if isinstance(first_cl.norm, _BatchNorm):
         removed += n_prune * 2
-
-    # Inner blocks.
     for inner in _iter_stem_inner_blocks(stem):
         if isinstance(inner, DSConv):
             kd = inner.depth_conv.conv.weight.shape[-1]
-            # depth_conv: (C0, 1, k, k) groups=C0
             removed += n_prune * kd * kd
             if inner.depth_conv.conv.bias is not None:
                 removed += n_prune
             if isinstance(inner.depth_conv.norm, _BatchNorm):
                 removed += n_prune * 2
-            # point_conv: (C0, C0, 1, 1) — 양방향 축소
             removed += n_total * n_total - n_surv * n_surv
             if inner.point_conv.conv.bias is not None:
-                removed += n_prune  # bias 는 출력 채널 기준
+                removed += n_prune
             if isinstance(inner.point_conv.norm, _BatchNorm):
                 removed += n_prune * 2
-        else:  # ResBlock
+        else:
             kr1 = inner.conv1.conv.weight.shape[-1]
             kr2 = inner.conv2.conv.weight.shape[-1]
-            # conv1, conv2 둘 다 (C0, C0, k, k) — 양방향
             removed += (n_total * n_total - n_surv * n_surv) * kr1 * kr1
             if inner.conv1.conv.bias is not None:
                 removed += n_prune
@@ -368,100 +502,83 @@ def _estimate_removed_input_stem(model: nn.Module, sparsity: float) -> int:
                 removed += n_prune
             if isinstance(inner.conv2.norm, _BatchNorm):
                 removed += n_prune * 2
-
-    # 다음 stage 첫 conv 의 입력 컬럼 (n_C0 × out_ch_first).
     post = _get_post_stem_first_conv(model)
     if post is not None:
-        post_w = post.conv.weight  # (out_first, C0, k, k)
+        post_w = post.conv.weight
         out_first = post_w.shape[0]
         kp = post_w.shape[-1]
         removed += n_prune * out_first * kp * kp
-
     return removed
 
 
 # ---------------------------------------------------------------------------
-# ClsHead (G_HEAD0 + G_HEAD1) — 마스킹 + 제거 파라미터 추정
+# ClsHead (G_HEAD0 + G_HEAD1)
 # ---------------------------------------------------------------------------
 
-# op_list[3] 은 width_list[1]→n_classes (B1: 1600→1000, 1.6×) 로 이미 near-complete.
-# 여기서 너무 많이 자르면 under-complete 매핑 → 표현력 급감.
 _HEAD1_MAX_SPARSITY = 0.40
 
 
 def _prune_head0(head: nn.Module, sparsity: float) -> None:
-    """G_HEAD0: op_list[0] Conv 출력 필터 + BN → op_list[2] Linear 입력 컬럼 마스킹."""
-    weight = head.op_list[0].conv.weight  # (width_list[0], in_ch, 1, 1)
+    weight = head.op_list[0].conv.weight
     n_total = weight.shape[0]
     n_prune = _calc_n_prune(n_total, sparsity)
     if n_prune <= 0:
         return
     idx = _topk_smallest_l2_idx(weight, n_prune)
-
     with torch.no_grad():
         head.op_list[0].conv.weight.data[idx] = 0.0
         if head.op_list[0].conv.bias is not None:
             head.op_list[0].conv.bias.data[idx] = 0.0
-        _zero_bn_(head.op_list[0].norm, idx)  # BN2d
-        # AdaptiveAvgPool2d + _try_squeeze 가 채널 순서를 보존하므로 같은 idx 적용.
+        _zero_bn_(head.op_list[0].norm, idx)
         head.op_list[2].linear.weight.data[:, idx] = 0.0
 
 
 def _prune_head1(head: nn.Module, sparsity: float) -> None:
-    """G_HEAD1: op_list[2] Linear 출력 행 + LayerNorm → op_list[3] Linear 입력 컬럼 마스킹."""
     effective_sp = min(sparsity, _HEAD1_MAX_SPARSITY)
-    weight = head.op_list[2].linear.weight  # (width_list[1], width_list[0])
+    weight = head.op_list[2].linear.weight
     n_total = weight.shape[0]
     n_prune = _calc_n_prune(n_total, effective_sp)
     if n_prune <= 0:
         return
     idx = _topk_smallest_l2_idx(weight, n_prune)
-
     with torch.no_grad():
         head.op_list[2].linear.weight.data[idx] = 0.0
         if head.op_list[2].linear.bias is not None:
             head.op_list[2].linear.bias.data[idx] = 0.0
-        _zero_bn_(head.op_list[2].norm, idx)  # LayerNorm (weight/bias만, running stats 없음)
-        # op_list[3].linear.bias 는 출력(n_classes) 소속이므로 건드리지 않음.
+        _zero_bn_(head.op_list[2].norm, idx)
         head.op_list[3].linear.weight.data[:, idx] = 0.0
 
 
 def _estimate_removed_head0(head: nn.Module, sparsity: float) -> int:
-    weight = head.op_list[0].conv.weight  # (w0, in_ch, 1, 1)
+    weight = head.op_list[0].conv.weight
     n_total, in_ch = weight.shape[0], weight.shape[1]
     out_features = head.op_list[2].linear.weight.shape[0]
-
     n_prune = _calc_n_prune(n_total, sparsity)
     if n_prune <= 0:
         return 0
-
-    removed = n_prune * in_ch  # op_list[0] Conv 출력 필터 (1×1 kernel)
+    removed = n_prune * in_ch
     if head.op_list[0].conv.bias is not None:
         removed += n_prune
     if getattr(head.op_list[0].norm, "weight", None) is not None:
-        removed += n_prune * 2  # BN weight + bias
-    removed += n_prune * out_features  # op_list[2] Linear 입력 컬럼
-    # cross-term (n_prune_h0 × n_prune_h1) 무시 → 약간 over-estimate (안전 방향)
+        removed += n_prune * 2
+    removed += n_prune * out_features
     return removed
 
 
 def _estimate_removed_head1(head: nn.Module, sparsity: float) -> int:
     effective_sp = min(sparsity, _HEAD1_MAX_SPARSITY)
-    weight = head.op_list[2].linear.weight  # (w1, w0)
+    weight = head.op_list[2].linear.weight
     n_total, in_features = weight.shape[0], weight.shape[1]
     out_classes = head.op_list[3].linear.weight.shape[0]
-
     n_prune = _calc_n_prune(n_total, effective_sp)
     if n_prune <= 0:
         return 0
-
-    removed = n_prune * in_features  # op_list[2] Linear 출력 행
+    removed = n_prune * in_features
     if head.op_list[2].linear.bias is not None:
         removed += n_prune
     if getattr(head.op_list[2].norm, "weight", None) is not None:
-        removed += n_prune * 2  # LayerNorm weight + bias
-    removed += n_prune * out_classes  # op_list[3] Linear 입력 컬럼
-    # op_list[3].bias (n_classes) 는 출력 소속이라 제거 대상 아님
+        removed += n_prune * 2
+    removed += n_prune * out_classes
     return removed
 
 
@@ -477,12 +594,11 @@ def _has_prunable_head(model: nn.Module) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 모델 전체 enumerate / 추정 / sparsity 이진탐색
+# 이진탐색 (변경 없음)
 # ---------------------------------------------------------------------------
 
 
 def _iter_prunable_modules(model: nn.Module):
-    """(kind, module) 튜플을 yield. kind ∈ {'mbconv', 'fmbconv'}."""
     for module in model.modules():
         if isinstance(module, MBConv):
             yield ("mbconv", module)
@@ -517,7 +633,6 @@ def _find_sparsity_by_bisection(
     iters: int = 64,
     head_sparsity_scale: float = 0.0,
 ) -> float:
-    """이진탐색으로 target_compression 비율을 만족시키는 per-group (backbone) sparsity 를 찾는다."""
     if target_compression <= 0:
         return 0.0
     total = _count_total_params(model)
@@ -545,11 +660,16 @@ class EfficientViTPruner:
         # ... 학습 루프 안에서, optimizer.step() 직후:
         pruner.apply(model)
 
+    성능 최적화 (index_refresh_steps):
+        - 매 step topk 재계산 대신, index_refresh_steps 마다 한 번만 계산.
+        - 기본값 100: 100 step 간격으로 pruned 채널 순위를 재평가.
+        - 초기 수렴 전이라면 50, 완전 수렴 후라면 200~500 으로 조절 가능.
+        - 0 으로 설정하면 매 step 재계산 (구버전 동작과 동일).
+
     head_sparsity_scale:
         Head sparsity = backbone sparsity × scale.
-        0.0 이면 head pruning 비활성 (기존 동작).
-        0.5 (기본값) 이면 backbone의 절반 sparsity 로 head 를 pruning.
-        G_HEAD1 은 내부적으로 _HEAD1_MAX_SPARSITY(=0.40) 상한이 적용된다.
+        0.0 이면 head pruning 비활성.
+        0.5 (기본값) 이면 backbone 절반 sparsity 로 head pruning.
     """
 
     def __init__(
@@ -559,10 +679,14 @@ class EfficientViTPruner:
         max_sparsity: float = 0.95,
         sparsity: float | None = None,
         head_sparsity_scale: float = 0.5,
+        index_refresh_steps: int = 100,
     ) -> None:
         self.target_compression = float(target_compression)
         self.max_sparsity = float(max_sparsity)
         self.head_sparsity_scale = float(head_sparsity_scale)
+        self.index_refresh_steps = int(index_refresh_steps)
+        self._step = 0
+
         if sparsity is not None:
             self.sparsity = float(sparsity)
         else:
@@ -571,6 +695,7 @@ class EfficientViTPruner:
                 head_sparsity_scale=self.head_sparsity_scale,
             )
 
+        # 통계 로그
         n_groups = sum(1 for _ in _iter_prunable_modules(model))
         total = _count_total_params(model)
         est_removed = _estimate_total_removed(model, self.sparsity, self.head_sparsity_scale)
@@ -585,24 +710,45 @@ class EfficientViTPruner:
             f"[EfficientViTPruner] target={self.target_compression*100:.1f}% "
             f"backbone_sparsity={self.sparsity:.4f} "
             f"prunable_groups={n_groups} estimated_compression={rate:.2f}% "
-            f"{head_info}"
+            f"{head_info} index_refresh_steps={self.index_refresh_steps}"
         )
 
-    def apply(self, model: nn.Module) -> None:
-        """모든 prunable 그룹에 대해 한 번 마스킹."""
-        if self.sparsity <= 0:
-            return
+        # init 시 한 번만 모든 prunable 텐서 레퍼런스 수집
+        self._groups: list[_PruneGroup] = self._collect_all_groups(model)
+
+        # 첫 마스크 계산
+        for g in self._groups:
+            g.refresh()
+
+    def _collect_all_groups(self, model: nn.Module) -> list[_PruneGroup]:
+        groups: list[_PruneGroup] = []
         for kind, mod in _iter_prunable_modules(model):
             if kind == "mbconv":
-                _prune_mbconv(mod, self.sparsity)
+                groups.append(_collect_mbconv_group(mod, self.sparsity))
             elif kind == "fmbconv":
-                _prune_fusedmbconv(mod, self.sparsity)
-        _prune_input_stem(model, self.sparsity)
-        if self.head_sparsity_scale > 0 and _has_prunable_head(model):
+                groups.append(_collect_fusedmbconv_group(mod, self.sparsity))
+        groups.extend(_collect_stem_groups(model, self.sparsity))
+        if self.head_sparsity_scale > 0:
             head_sp = self.sparsity * self.head_sparsity_scale
-            head = model.head  # type: ignore[attr-defined]
-            _prune_head0(head, head_sp)
-            _prune_head1(head, head_sp)
+            groups.extend(_collect_head_groups(model, head_sp))
+        return groups
+
+    def apply(self, model: nn.Module) -> None:  # noqa: ARG002  (model 인자는 하위 호환성 유지)
+        """캐시된 마스크로 모든 prunable 그룹을 마스킹한다.
+
+        index_refresh_steps 마다 topk 인덱스를 재계산한다.
+        model 인자는 하위 호환성을 위해 유지하지만 사용하지 않는다
+        (텐서 레퍼런스는 _groups 에 이미 저장되어 있음).
+        """
+        if self.sparsity <= 0:
+            return
+        need_refresh = (self.index_refresh_steps <= 0) or (self._step % self.index_refresh_steps == 0)
+        if need_refresh:
+            for g in self._groups:
+                g.refresh()
+        for g in self._groups:
+            g.apply()
+        self._step += 1
 
     @torch.no_grad()
     def log_sparsity(self, model: nn.Module) -> dict[str, float]:
@@ -618,7 +764,6 @@ class EfficientViTPruner:
             norms = torch.norm(w.detach().reshape(n_filt, -1), dim=1)
             n_total += n_filt
             n_zero += int((norms == 0).sum().item())
-        # Stem 첫 conv 의 출력 채널 zero 도 함께 집계.
         stem = _get_stem_op_seq(model)
         if stem is not None and len(stem.op_list) > 0 and isinstance(stem.op_list[0], ConvLayer):
             w = stem.op_list[0].conv.weight
@@ -626,16 +771,13 @@ class EfficientViTPruner:
             norms = torch.norm(w.detach().reshape(n_filt, -1), dim=1)
             n_total += n_filt
             n_zero += int((norms == 0).sum().item())
-        # Head 출력 채널 zero 집계 (head pruning 활성 시).
         if self.head_sparsity_scale > 0 and _has_prunable_head(model):
             head = model.head  # type: ignore[attr-defined]
-            # G_HEAD0: op_list[0] Conv 출력 필터
             w0 = head.op_list[0].conv.weight
             n0 = w0.shape[0]
             norms0 = torch.norm(w0.detach().reshape(n0, -1), dim=1)
             n_total += n0
             n_zero += int((norms0 == 0).sum().item())
-            # G_HEAD1: op_list[2] Linear 출력 행
             w1 = head.op_list[2].linear.weight
             n1 = w1.shape[0]
             norms1 = torch.norm(w1.detach(), dim=1)

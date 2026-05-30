@@ -1409,6 +1409,63 @@ default config 에서는 영향 없으나, `local_module=GLUMBConv` 사용 시 �
 
 ## 14. 업데이트 이력 (Changelog)
 
+### 2026-05-30 (rev 8) — Soft Pruning CPU 병목 최적화
+
+**배경**: B2(24 M param)처럼 큰 모델에서 `pruner.apply()` 가 매 step 호출될 때
+아래 세 가지 CPU 병목이 관측됨:
+
+| 병목 | 원인 | 비용 |
+|------|------|------|
+| `model.modules()` 순회 | 매 step Python 루프로 전체 모듈 탐색 | 상수 오버헤드 |
+| `_topk_smallest_l2_idx` 재계산 | `detach+reshape+norm+topk` CUDA 커널 N번 launch | 가장 큰 비중 |
+| `weight.data[idx] = 0` fancy-index scatter | 인덱스 기반 scatter 커널 → CPU-GPU sync | 커널 수 ∝ 그룹 수 |
+
+**구현한 최적화 3가지**
+
+1. **init 시 텐서 레퍼런스 수집 (`_PruneGroup`)**: `model.modules()` 순회를 init 1회로 고정.  
+   매 `apply()` 에서는 `self._groups` 리스트만 순회한다.
+
+2. **인덱스 캐싱 (`index_refresh_steps`)**: topk 재계산을 매 step 대신 N step 마다만 수행.  
+   sparsity 가 결정된 이후 pruned 채널의 순위는 수백 step 동안 거의 변하지 않으므로
+   정확도 손실 없이 계산량을 대폭 줄인다.  
+   기본값 `100`; 완전 수렴 후 실험이라면 `200–500` 도 가능.  
+   `0`으로 설정하면 구버전과 동일하게 매 step 재계산.
+
+3. **벡터화 마스킹 (`weight *= mask`)**: `weight.data[idx] = 0` (fancy-index scatter) 대신
+   사전 할당된 `(n,)` float 마스크로 `weight.mul_(mask.view(...))` 를 수행한다.
+   단일 elementwise CUDA 커널 1개로 처리되어 커널 launch 수가 줄어든다.
+
+**수정 파일**
+- `efficientvit/clscore/pruning/efficientvit_pruning.py`:
+  - `_PruneGroup` dataclass 추가 (criterion, targets, _mask, `refresh()`, `apply()`).
+  - `_collect_mbconv_group`, `_collect_fusedmbconv_group`, `_collect_stem_groups`, `_collect_head_groups` 수집 함수 추가.
+  - `EfficientViTPruner.__init__`: `index_refresh_steps` 인자 추가 (기본 100), `_collect_all_groups` 호출, 초기 `refresh()`.
+  - `EfficientViTPruner.apply()`: `_groups` 리스트 순회 + 조건부 `refresh()` → `apply()`.
+  - 기존 `_prune_mbconv`, `_prune_input_stem`, `_prune_head*` 등 함수는 `log_sparsity` / 호환성 유지 목적으로 보존.
+- `applications/efficientvit_cls/train_efficientvit_cls_model.py`:
+  - `--prune_refresh_steps` (int, default=100) argparse 인자 추가.
+  - `EfficientViTPruner` 생성 시 `index_refresh_steps` 전달.
+
+**사용법**
+
+```bash
+# 기본 (100 step 마다 인덱스 갱신)
+--target_compression 0.50
+
+# 더 적극적 캐싱 (수렴 후 실험)
+--target_compression 0.50 --prune_refresh_steps 500
+
+# 구버전 동작 (매 step 재계산)
+--target_compression 0.50 --prune_refresh_steps 0
+```
+
+**시작 로그 확인**
+```
+[EfficientViTPruner] target=50.0% backbone_sparsity=X.XXXX ... index_refresh_steps=100
+```
+
+---
+
 ### 2026-05-30 (rev 7) — EfficientViT-B2 배치 사이즈 조정 및 Pruning 명령어 추가
 
 **배경**: B2 모델(24.3 M 파라미터)은 12 GB 미만 VRAM 환경에서 기본 `base_batch_size=128` 사용 시

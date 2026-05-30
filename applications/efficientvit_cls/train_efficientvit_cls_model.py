@@ -55,6 +55,14 @@ parser.add_argument(
     help="head sparsity = backbone_sparsity × scale. 0.0 disables head pruning. "
          "G_HEAD1 은 내부적으로 0.40 상한이 별도 적용된다.",
 )
+parser.add_argument(
+    "--prune_refresh_steps",
+    type=int,
+    default=100,
+    help="pruning index refresh interval (steps). "
+         "topk 재계산을 매 step 대신 N step 마다 수행해 CPU 병목을 완화한다. "
+         "0 으로 설정하면 매 step 재계산 (구버전 동작). 권장: 100–500.",
+)
 
 # Weights & Biases logging (optional, opt-in).
 parser.add_argument("--wandb", action="store_true", help="enable wandb logging.")
@@ -101,6 +109,7 @@ def main():
             target_compression=args.target_compression,
             max_sparsity=args.pruning_max_sparsity,
             head_sparsity_scale=args.pruning_head_sparsity_scale,
+            index_refresh_steps=args.prune_refresh_steps,
         )
     else:
         pruner = None
