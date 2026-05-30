@@ -713,12 +713,11 @@ class EfficientViTPruner:
             f"{head_info} index_refresh_steps={self.index_refresh_steps}"
         )
 
-        # init 시 한 번만 모든 prunable 텐서 레퍼런스 수집
-        self._groups: list[_PruneGroup] = self._collect_all_groups(model)
-
-        # 첫 마스크 계산
-        for g in self._groups:
-            g.refresh()
+        # 그룹 수집은 apply() 첫 호출 시 지연 실행한다.
+        # __init__ 시점에는 모델이 CPU에 있고, Trainer.__init__ 안에서 model.cuda() 가
+        # 호출된다. BN 버퍼(running_mean/var)는 _buffers 교체 방식이라 여기서 수집하면
+        # CPU 레퍼런스가 남아 device mismatch 가 발생하므로 반드시 지연해야 한다.
+        self._groups: list[_PruneGroup] = []
 
     def _collect_all_groups(self, model: nn.Module) -> list[_PruneGroup]:
         groups: list[_PruneGroup] = []
@@ -733,15 +732,24 @@ class EfficientViTPruner:
             groups.extend(_collect_head_groups(model, head_sp))
         return groups
 
-    def apply(self, model: nn.Module) -> None:  # noqa: ARG002  (model 인자는 하위 호환성 유지)
+    def apply(self, model: nn.Module) -> None:
         """캐시된 마스크로 모든 prunable 그룹을 마스킹한다.
 
-        index_refresh_steps 마다 topk 인덱스를 재계산한다.
-        model 인자는 하위 호환성을 위해 유지하지만 사용하지 않는다
-        (텐서 레퍼런스는 _groups 에 이미 저장되어 있음).
+        첫 호출 시 그룹 수집 + 마스크 초기화를 수행한다 (lazy init).
+        이 시점에는 model 이 이미 CUDA 에 올라가 있으므로 device mismatch 가 없다.
+        이후 index_refresh_steps 마다 topk 인덱스를 재계산한다.
         """
         if self.sparsity <= 0:
             return
+
+        # Lazy init: 첫 apply() 에서 model 이 CUDA 에 있을 때 수집.
+        if not self._groups:
+            self._groups = self._collect_all_groups(model)
+            for g in self._groups:
+                g.refresh()
+            self._step += 1
+            return
+
         need_refresh = (self.index_refresh_steps <= 0) or (self._step % self.index_refresh_steps == 0)
         if need_refresh:
             for g in self._groups:
