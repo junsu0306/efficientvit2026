@@ -987,6 +987,130 @@ CUDA_VISIBLE_DEVICES=7 torchrun --nproc_per_node=1 --master_port=12345 \
 --pruning_head_sparsity_scale 0.0
 ```
 
+### 9.2-D EfficientViT-B2 Pruning (target=50% / 70%)
+
+> **B2 모델 특성**
+> - 파라미터: ~24.3 M (B1의 약 2.7×)
+> - 12 GB 미만 VRAM 환경을 위해 `base_batch_size: 32` 로 고정 (`efficientvit_b2.yaml` 에 반영)
+> - Pretrained weight: `assets/checkpoints/efficientvit_cls/efficientvit_b2_r288.pt`
+
+> **VRAM 참고**  
+> `base_batch_size=32` + GPU 1장 기준 약 10–11 GB 사용 예상 (bf16 AMP).  
+> OOM 시 `--data_provider.base_batch_size 16` 으로 CLI override 가능.
+
+#### Step 0: Base Model Validation (B2, pretrained 단발 평가)
+
+```bash
+CUDA_VISIBLE_DEVICES=7 python applications/efficientvit_cls/eval_efficientvit_cls_model.py \
+  --model efficientvit-b2 \
+  --weight_url assets/checkpoints/efficientvit_cls/efficientvit_b2_r288.pt \
+  --path /workspace/etri_iitp/JS/efficientvit2026/data/imagenet/val \
+  --gpu 7 \
+  --batch_size 64 \
+  --wandb \
+  --wandb_project efficientvit-pruning \
+  --wandb_run_name b2_base_pretrained_eval
+```
+
+#### Step 1: Fine-tune Baseline (pruning 없음)
+
+```bash
+CUDA_VISIBLE_DEVICES=7 torchrun --nproc_per_node=1 --master_port=12345 \
+  applications/efficientvit_cls/train_efficientvit_cls_model.py \
+    applications/efficientvit_cls/configs/imagenet/efficientvit_b2.yaml \
+    --path /workspace/etri_iitp/JS/efficientvit2026/output/b2_finetune_baseline \
+    --init_from assets/checkpoints/efficientvit_cls/efficientvit_b2_r288.pt \
+    --amp bf16 \
+    --wandb \
+    --wandb_project efficientvit-pruning \
+    --wandb_run_name b2_finetune_baseline \
+    --data_provider.data_dir /workspace/etri_iitp/JS/efficientvit2026/data/imagenet
+```
+
+#### Step 2-A: Soft Pruning Fine-tune — target=50%
+
+```bash
+CUDA_VISIBLE_DEVICES=7 torchrun --nproc_per_node=1 --master_port=12345 \
+  applications/efficientvit_cls/train_efficientvit_cls_model.py \
+    applications/efficientvit_cls/configs/imagenet/efficientvit_b2.yaml \
+    --path /workspace/etri_iitp/JS/efficientvit2026/output/b2_prune50 \
+    --init_from assets/checkpoints/efficientvit_cls/efficientvit_b2_r288.pt \
+    --amp bf16 \
+    --target_compression 0.50 \
+    --pruning_head_sparsity_scale 0.5 \
+    --wandb \
+    --wandb_project efficientvit-pruning \
+    --wandb_run_name b2_prune50_head05 \
+    --data_provider.data_dir /workspace/etri_iitp/JS/efficientvit2026/data/imagenet
+```
+
+#### Step 2-B: Soft Pruning Fine-tune — target=70%
+
+```bash
+CUDA_VISIBLE_DEVICES=7 torchrun --nproc_per_node=1 --master_port=12345 \
+  applications/efficientvit_cls/train_efficientvit_cls_model.py \
+    applications/efficientvit_cls/configs/imagenet/efficientvit_b2.yaml \
+    --path /workspace/etri_iitp/JS/efficientvit2026/output/b2_prune70 \
+    --init_from assets/checkpoints/efficientvit_cls/efficientvit_b2_r288.pt \
+    --amp bf16 \
+    --target_compression 0.70 \
+    --pruning_head_sparsity_scale 0.5 \
+    --wandb \
+    --wandb_project efficientvit-pruning \
+    --wandb_run_name b2_prune70_head05 \
+    --data_provider.data_dir /workspace/etri_iitp/JS/efficientvit2026/data/imagenet
+```
+
+> **sparsity 확인**: 학습 시작 직후 `[EfficientViTPruner] target=50.0% backbone_sparsity=X.XXXX ... head_sparsity=X.XXXX` 로그로 실제 값 검증.
+
+#### Step 3: Reducing
+
+```bash
+# target=50%
+python applications/efficientvit_cls/reduce_efficientvit_cls_model.py \
+    --model efficientvit-b2 \
+    --checkpoint /workspace/etri_iitp/JS/efficientvit2026/output/b2_prune50/checkpoint/model_best.pt \
+    --output    /workspace/etri_iitp/JS/efficientvit2026/output/b2_prune50/reduced_b2_50pct.pt \
+    --input-size 288 \
+    --save-full-model
+
+# target=70%
+python applications/efficientvit_cls/reduce_efficientvit_cls_model.py \
+    --model efficientvit-b2 \
+    --checkpoint /workspace/etri_iitp/JS/efficientvit2026/output/b2_prune70/checkpoint/model_best.pt \
+    --output    /workspace/etri_iitp/JS/efficientvit2026/output/b2_prune70/reduced_b2_70pct.pt \
+    --input-size 288 \
+    --save-full-model
+```
+
+#### Step 4: Eval (Reduced 모델)
+
+```bash
+# target=50%
+CUDA_VISIBLE_DEVICES=7 python applications/efficientvit_cls/eval_efficientvit_cls_model.py \
+  --model efficientvit-b2 \
+  --weight_url /workspace/etri_iitp/JS/efficientvit2026/output/b2_prune50/reduced_b2_50pct.pt \
+  --path /workspace/etri_iitp/JS/efficientvit2026/data/imagenet/val \
+  --gpu 7 \
+  --batch_size 64 \
+  --wandb \
+  --wandb_project efficientvit-pruning \
+  --wandb_run_name b2_prune50_reduced_eval
+
+# target=70%
+CUDA_VISIBLE_DEVICES=7 python applications/efficientvit_cls/eval_efficientvit_cls_model.py \
+  --model efficientvit-b2 \
+  --weight_url /workspace/etri_iitp/JS/efficientvit2026/output/b2_prune70/reduced_b2_70pct.pt \
+  --path /workspace/etri_iitp/JS/efficientvit2026/data/imagenet/val \
+  --gpu 7 \
+  --batch_size 64 \
+  --wandb \
+  --wandb_project efficientvit-pruning \
+  --wandb_run_name b2_prune70_reduced_eval
+```
+
+---
+
 ### 9.3 학습 후 Reducing + Eval (B1, target=15% 예시)
 
 fine-tune 완료 후 soft-pruned weight 를 실제 작은 dense 모델로 변환한 뒤 정확도를 측정한다.
@@ -1284,6 +1408,27 @@ default config 에서는 영향 없으나, `local_module=GLUMBConv` 사용 시 �
 ---
 
 ## 14. 업데이트 이력 (Changelog)
+
+### 2026-05-30 (rev 7) — EfficientViT-B2 배치 사이즈 조정 및 Pruning 명령어 추가
+
+**배경**: B2 모델(24.3 M 파라미터)은 12 GB 미만 VRAM 환경에서 기본 `base_batch_size=128` 사용 시
+OOM 위험이 있다. B2 한정으로 배치 사이즈를 32로 줄여 안정적 학습을 가능하게 함.
+
+**수정**
+- `applications/efficientvit_cls/configs/imagenet/efficientvit_b2.yaml`:
+  - `data_provider.base_batch_size: 32` 추가 (default.yaml 의 128 을 B2 한정 override).
+  - 다른 모델(B1, B3, L-series)에는 영향 없음.
+
+**추가**
+- 보고서 §9.2-D 신규: B2 전용 Pruning 섹션.
+  - Step 0: Base Model Validation (B2 pretrained 단발 eval).
+  - Step 1: Fine-tune Baseline (pruning 없음).
+  - Step 2-A: target=50% Soft Pruning Fine-tune 명령어.
+  - Step 2-B: target=70% Soft Pruning Fine-tune 명령어.
+  - Step 3: Reducing 명령어 (50% / 70%, `--input-size 288`).
+  - Step 4: Reduced 모델 Eval 명령어.
+
+---
 
 ### 2026-05-02 (rev 6) — Base Model Validation 명령어 추가 / eval 스크립트 wandb 지원
 
