@@ -16,6 +16,11 @@ assets/checkpoints/**/*.pth
 
 !assets/checkpoints/efficientvit_cls/efficientvit_b1_r224.pt
 !assets/checkpoints/efficientvit_cls/efficientvit_b2_r224.pt
+!assets/checkpoints/efficientvit_cls/efficientvit_b1_original_224.pt
+!assets/checkpoints/efficientvit_cls/efficientvit_b2_original_r224.pt
+
+
+
 assets/data/
 assets/export_models/
 
