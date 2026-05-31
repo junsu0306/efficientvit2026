@@ -1657,93 +1657,103 @@ full model 버전 = "구조까지 포함된 완성된 파일" → 바로 열어�
 
 ### 개요
 
-학습된 `.pt` 체크포인트를 ONNX 포맷으로 변환한 뒤, Mobilint NPU 컴파일러용으로 입력 포맷을 NHWC로 변환하는 두 단계로 구성된다.
+학습된 `.pt` 체크포인트를 **NCHW 입력 ONNX 단일 파일**로 export 한다. Mobilint NPU
+컴파일(qbcompiler → `.mxq`)은 NPU 프로젝트의 Docker 안에서 수행되며, 그 단계에서
+`in_dformats={"input": "NCHW"}` 로 입력 레이아웃을 직접 선언한다. 따라서 ONNX 쪽은
+NCHW 그대로 두고 입력 텐서 이름만 `input` 으로 맞추면 된다.
 
 | 스크립트 | 역할 |
 |----------|------|
-| `efficientvit/assets/onnx_export.py` | `.pt` → `.onnx` 변환 (NCHW 입력) |
-| `efficientvit/assets/onnx_nhwc_convert.py` | ONNX 입력을 NCHW → NHWC로 변환 |
+| `efficientvit/assets/export_original_to_onnx.py` | `.pt` → NCHW `.onnx` 변환 (입력명 `input`, 출력명 `output`) |
 
 > **opset 13 사용 이유**  
 > Opset 11은 EfficientViT에 쓰이는 HardSwish 계열 활성화 함수를 단일 노드로 지원하지 않는다.  
 > NPU 배포 시 **opset 13 이상** 사용을 권장한다.
 
-> **NHWC 변환 이유 (Mobilint NPU)**  
-> Mobilint 컴파일러는 4D 입력을 무조건 NHWC로 간주한다.  
-> PyTorch 기본 출력인 NCHW `(1,3,224,224)` 를 그대로 넣으면 컴파일러가 C=224로 해석해  
-> 양자화 zeropoint가 오버플로우(`zeropoint=-2147483648`)된다.  
-> ONNX 앞에 Transpose 노드를 삽입해 입력을 NHWC `(1,224,224,3)` 로 만들어야 한다.
+> **⚠️ NHWC 그래프 재작성을 하지 않는 이유 (과거 `onnx_nhwc_convert.py` 제거 배경)**  
+> 이전에는 export 후 ONNX 앞에 Transpose 노드를 삽입해 입력을 NHWC `(1,224,224,3)` 로
+> 재작성했다. 그러나 이 그래프 재작성 과정에서 Slice 노드의 INT64 상수가
+> FLOAT64(double)로 잘못 저장 → qbcompiler 양자화기가 float 텐서로 인식 →
+> range=0 → scale=0 → zeropoint = -min/scale = ±inf → INT32 오버플로우 →
+> `zeropoint=-2147483648 is out of range` 로 양자화가 항상 깨졌다.  
+> ⇒ **NHWC 재작성을 폐기**하고, NCHW 그대로 export 한 뒤 compile 단계에서
+> `in_dformats` 로 NCHW 임을 선언하는 방식으로 전환했다. `torch.onnx.export` 직접
+> 경로는 상수를 INT64 로 올바르게 저장하므로 안전하다.  
+> (같은 이유로 onnxsim simplify 등 그래프 재작성 도구도 사용하지 않는다.)
 
 ### 실행 환경 설정
 
-스크립트가 `efficientvit` 패키지를 인식하려면 `PYTHONPATH`를 프로젝트 루트로 설정해야 한다:
-
-```bash
-export PYTHONPATH=/workspace/etri_iitp/JS/efficientvit2026
-```
+`export_original_to_onnx.py` 는 자신의 위치에서 repo 루트를 계산해 `sys.path` 에 자동
+추가하므로 **`PYTHONPATH` 설정이 필요 없다.** repo 루트에서 그냥 실행하면 된다.
+(`onnx` 패키지만 설치돼 있으면 됨: `pip install onnx`)
 
 ### 변환 명령어
 
-**B0 모델**
+**원본 b0 / b1 한 번에 (인자 없이 실행 → 기본 배치 모드)**
 ```bash
-# Step 1: ONNX 추출
-PYTHONPATH=/workspace/etri_iitp/JS/efficientvit2026 python efficientvit/assets/onnx_export.py \
-  --export_path assets/export_models/efficientvit_b0_r224.onnx \
-  --model efficientvit-b0 \
-  --weight_url assets/checkpoints/efficientvit_cls/efficientvit_b0_r224.pt \
-  --resolution 224 224 \
-  --bs 1 \
-  --op_set 13
+python efficientvit/assets/export_original_to_onnx.py
+```
+→ `assets/export_models/` 아래에 다음 2개 파일 생성:
+`efficientvit_b0_original_r224_nchw.onnx`, `efficientvit_b1_original_r224_nchw.onnx`
 
-# Step 2: NHWC 변환 (Mobilint NPU용)
-python efficientvit/assets/onnx_nhwc_convert.py \
-  --input  assets/export_models/efficientvit_b0_r224.onnx \
-  --output assets/export_models/efficientvit_b0_r224_nhwc.onnx
+**특정 원본 모델 1개만 (registered 모델명 사용)**
+```bash
+python efficientvit/assets/export_original_to_onnx.py \
+  --model efficientvit-b0 \
+  --weight assets/checkpoints/efficientvit_cls/efficientvit_b0_original_r224.pt \
+  --output assets/export_models/efficientvit_b0_original_r224_nchw.onnx
 ```
 
-**B1 모델**
-```bash
-# Step 1: ONNX 추출
-PYTHONPATH=/workspace/etri_iitp/JS/efficientvit2026 python efficientvit/assets/onnx_export.py \
-  --export_path assets/export_models/efficientvit_b1_r224.onnx \
-  --model efficientvit-b1 \
-  --weight_url assets/checkpoints/efficientvit_cls/efficientvit_b1_r224.pt \
-  --resolution 224 224 \
-  --bs 1 \
-  --op_set 13
+**pruning 후 reduce 된 모델 (채널이 줄어든 구조)**
 
-# Step 2: NHWC 변환 (Mobilint NPU용)
-python efficientvit/assets/onnx_nhwc_convert.py \
-  --input  assets/export_models/efficientvit_b1_r224.onnx \
-  --output assets/export_models/efficientvit_b1_r224_nhwc.onnx
+reduce 된 모델은 채널 수가 달라 registered 팩토리(`create_efficientvit_cls_model`)로는
+구조를 재현할 수 없다. 따라서 [`efficientvit_reducing.py`](efficientvit/clscore/pruning/efficientvit_reducing.py)
+를 `--save-full-model` 로 **전체 모델 객체**로 저장한 뒤, export 시 `--source full-model`
+로 그 객체를 통째로 로드한다.
+```bash
+# 1) reduce 결과를 full-model 객체로 저장
+python -m efficientvit.clscore.pruning.efficientvit_reducing \
+  --model efficientvit-b1 \
+  --checkpoint <soft-pruned-checkpoint>.pt \
+  --output assets/export_models/efficientvit_b1_reduced.pt \
+  --save-full-model
+
+# 2) full-model 객체 → NCHW ONNX
+python efficientvit/assets/export_original_to_onnx.py \
+  --source full-model \
+  --weight assets/export_models/efficientvit_b1_reduced.pt \
+  --output assets/export_models/efficientvit_b1_reduced_r224_nchw.onnx
 ```
 
 ### 주요 인자
 
-**onnx_export.py**
+**export_original_to_onnx.py**
 
 | 인자 | 설명 |
 |------|------|
-| `--export_path` | 출력 ONNX 파일 경로 |
-| `--model` | 모델 이름 (예: `efficientvit-b0`, `efficientvit-b1`) |
-| `--weight_url` | 로드할 `.pt` 체크포인트 경로 (생략 시 랜덤 가중치) |
-| `--resolution` | 입력 해상도 (예: `224 224`) |
-| `--bs` | 배치 사이즈 |
-| `--op_set` | ONNX opset 버전 (기본값: 11, NPU용 13 권장) |
-| `--task` | `cls` 또는 `seg` (기본값: `cls`) |
+| `--source` | `factory`(기본, registered 원본 모델) / `full-model`(reduce 된 전체 모델 객체) |
+| `--model` | registered 모델명 (예: `efficientvit-b0`). `--source factory` 에 필요 |
+| `--weight` | 로드할 `.pt` 경로 |
+| `--output` | 출력 `.onnx` 경로 |
+| `--resolution` | 입력 해상도 (기본값: 224) |
+| `--opset` | ONNX opset 버전 (기본값: 13) |
 
-**onnx_nhwc_convert.py**
+> `--weight`/`--output` 을 주면 단일 모델 모드, 둘 다 생략하면 원본 b0/b1 배치 모드로 동작한다.
 
-| 인자 | 설명 |
-|------|------|
-| `--input` | 변환할 ONNX 파일 경로 (NCHW 입력) |
-| `--output` | 저장할 ONNX 파일 경로 (NHWC 입력) |
+### 성공 기준 (스크립트 출력으로 확인)
+
+- `ONNX 검증 통과 | 입력 'input' shape=[1, 3, 224, 224]` ← 입력 이름 `input`, shape `[1,3,224,224]`
+- `[OK] FLOAT64 상수 없음` ← `[WARNING]` 이 뜨면 ONNX 가 오염된 것이니 실패로 간주
+- 종료 코드 0 (검증 실패 시 1)
 
 ### 출력 파일
 
 | 파일 | 용도 |
 |------|------|
-| `assets/export_models/efficientvit_b0_r224.onnx` | 일반 ONNX (NCHW) |
-| `assets/export_models/efficientvit_b0_r224_nhwc.onnx` | Mobilint NPU 컴파일러용 (NHWC) |
-| `assets/export_models/efficientvit_b1_r224.onnx` | 일반 ONNX (NCHW) |
-| `assets/export_models/efficientvit_b1_r224_nhwc.onnx` | Mobilint NPU 컴파일러용 (NHWC) |
+| `assets/export_models/efficientvit_b0_original_r224_nchw.onnx` | 원본 b0, NCHW ONNX (NPU 컴파일 입력) |
+| `assets/export_models/efficientvit_b1_original_r224_nchw.onnx` | 원본 b1, NCHW ONNX (NPU 컴파일 입력) |
+| `assets/export_models/efficientvit_b1_reduced_r224_nchw.onnx` | (예시) reduce 된 b1, NCHW ONNX |
+
+> 생성된 `.onnx` 를 NPU 프로젝트로 가져가 Docker 안에서 qbcompiler 로 `.mxq` 컴파일한다.
+> 캘리브레이션 데이터는 CHW `(3,224,224)` float32 `.npy`(ImageNet 정규화)이며, 이 export
+> 단계에서는 만들지 않는다.
