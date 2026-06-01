@@ -152,6 +152,12 @@ def export_to_onnx(model: torch.nn.Module, onnx_path: str, resolution: int, opse
             do_constant_folding=True,    # ← 유지
         )
 
+    # shape inference: 그래프 구조 변경 없이 중간 텐서 shape 메타데이터만 추가.
+    # 컴파일러가 shape를 실행 시마다 재계산하는 overhead를 없앤다.
+    onnx_model = onnx.load(onnx_path)
+    onnx_model = onnx.shape_inference.infer_shapes(onnx_model)
+    onnx.save(onnx_model, onnx_path)
+
     # ── 성공 기준 검증 ────────────────────────────────────────────────────────
     ok = True
     onnx_model = onnx.load(onnx_path)
