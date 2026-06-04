@@ -882,20 +882,18 @@ class LiteMLA(nn.Module):
         # K 를 전치해서 (d, N) 형태로.
         trans_k = k.transpose(-1, -2)
 
-        # --- 정규화 분모까지 한 번에 계산하는 1-패딩 트릭 ---
-        # 분자: out  = Σ_j V_j · K_jᵀ · Q_i
-        # 분모: norm = Σ_j  1  · K_jᵀ · Q_i
-        # V 끝에 1 로 채워진 한 행을 붙이면(= 채널 축 마지막에 pad) 한 번의
-        # matmul 로 [out; norm] 이 동시에 계산된다.
-        v = F.pad(v, (0, 0, 0, 1), mode="constant", value=1)
-
-        # 선형 어텐션 핵심: (V·Kᵀ)·Q 순서로 곱해 중간 행렬 크기를 (d+1)×d 로 유지 → O(N·d²).
-        vk = torch.matmul(v, trans_k)  # (B, heads, d+1, d)
-        out = torch.matmul(vk, q)      # (B, heads, d+1, N)
+        # 분자: (V·Kᵀ)·Q — O(N·d²) 선형 어텐션 핵심.
+        vk = torch.matmul(v, trans_k)   # (B, heads, d, d)
+        out = torch.matmul(vk, q)       # (B, heads, d, N)
         if out.dtype == torch.bfloat16:
             out = out.float()
-        # 마지막 행(= 분모) 으로 나머지 행(= 분자) 을 나눠 정규화. eps 는 0-division 방지.
-        out = out[:, :, :-1] / (out[:, :, -1:] + self.eps)
+        # 분모: Σ_j φ(K_j) · Q_i — F.pad+slice 대신 명시적 sum으로 계산.
+        # F.pad(v, (0,0,0,1)) + out[:,:,:-1]/out[:,:,-1:] 패턴은 qbcompiler
+        # 양자화기가 Slice/Pad 경계를 처리하지 못해 zeropoint overflow를 일으킨다.
+        # sum → matmul 로 바꾸면 수학적으로 동일하고 ONNX 그래프가 단순해진다.
+        k_sum = k.sum(dim=-1, keepdim=True)                    # (B, heads, d, 1)
+        out_den = torch.matmul(k_sum.transpose(-1, -2), q)    # (B, heads, 1, N)
+        out = out / (out_den + self.eps)
 
         # (B, heads*d, H, W) 로 복원.
         out = torch.reshape(out, (B, -1, H, W))

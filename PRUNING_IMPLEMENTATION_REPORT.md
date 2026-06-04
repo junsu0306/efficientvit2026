@@ -1757,3 +1757,54 @@ python efficientvit/assets/export_original_to_onnx.py \
 > 생성된 `.onnx` 를 NPU 프로젝트로 가져가 Docker 안에서 qbcompiler 로 `.mxq` 컴파일한다.
 > 캘리브레이션 데이터는 CHW `(3,224,224)` float32 `.npy`(ImageNet 정규화)이며, 이 export
 > 단계에서는 만들지 않는다.
+
+---
+
+## 10. LiteMLA `relu_linear_att` 수정 — qbcompiler 양자화 호환
+
+### 배경
+
+원본(mit-han-lab) 모델을 ONNX 로 export 하면 `FLOAT64 상수 없음` 검증은 통과하지만
+qbcompiler 양자화 단계에서 zeropoint overflow 가 반복 발생했다.
+
+timm 의 동일 모델은 정상 컴파일됨을 확인하고 두 ONNX 그래프를 비교한 결과,
+`efficientvit/models/nn/ops.py` 의 `LiteMLA.relu_linear_att` 내부 패턴이 원인으로
+특정됐다.
+
+### 원인
+
+```python
+# 변경 전 — F.pad + slice 패턴
+v = F.pad(v, (0, 0, 0, 1), mode="constant", value=1)
+vk  = torch.matmul(v, trans_k)       # (B, heads, d+1, d)
+out = torch.matmul(vk, q)            # (B, heads, d+1, N)
+out = out[:, :, :-1] / (out[:, :, -1:] + self.eps)
+```
+
+`F.pad → matmul → Slice(:-1) / Slice(-1:)` 조합이 ONNX 에서 `Pad + Slice(steps=1, end=-1)` 노드로
+표현된다. qbcompiler 의 양자화기가 이 Pad/Slice 경계에서 텐서 range 를 계산하지 못해
+`scale = 0 → zeropoint = ±inf → INT32 overflow` 가 발생했다.
+
+### 수정
+
+```python
+# 변경 후 — 분자/분모 명시적 분리 (수학적으로 동일)
+vk      = torch.matmul(v, trans_k)                  # (B, heads, d, d)
+out     = torch.matmul(vk, q)                       # (B, heads, d, N)  ← 분자
+k_sum   = k.sum(dim=-1, keepdim=True)               # (B, heads, d, 1)
+out_den = torch.matmul(k_sum.transpose(-1, -2), q)  # (B, heads, 1, N) ← 분모
+out     = out / (out_den + self.eps)
+```
+
+F.pad 와 음수 인덱스 Slice 를 제거하고, 분모를 `k.sum(dim=-1)` 으로 명시적으로 계산한다.
+결과값은 bitwise 수준에서 동일하다 (matmul 결합법칙으로 증명 가능).
+
+### 영향 범위
+
+| 항목 | 내용 |
+|------|------|
+| 수정 파일 | `efficientvit/models/nn/ops.py` — `LiteMLA.relu_linear_att` |
+| 정확도 영향 | **없음** — 수학적으로 등가 변환 |
+| 적용 범위 | B/L 시리즈 전체, 원본·reduced 모델 모두 |
+| GPU 추론 속도 | matmul 1회 추가, 무시할 수준 |
+| 학습 가중치 | 변경 없음 — `.pt` 파일 재생성 불필요 |
