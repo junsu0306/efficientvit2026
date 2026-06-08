@@ -1806,3 +1806,50 @@ F.pad 와 음수 인덱스 Slice 를 제거하고, 분모를 `k.sum(dim=-1)` 으
 | 적용 범위 | B/L 시리즈 전체, 원본·reduced 모델 모두 |
 | GPU 추론 속도 | matmul 1회 추가, 무시할 수준 |
 | 학습 가중치 | 변경 없음 — `.pt` 파일 재생성 불필요 |
+
+---
+
+### 추가 수정 — `torch.reshape` 음수 인덱스 (`-1`) 제거
+
+#### 원인
+
+`backend="torch"` 경로로 qbcompiler 에 모델을 넘기면 다음 에러가 발생한다:
+
+```
+{"fn": "torch.reshape", "arg_map": {"arg0": "$0", "arg1": ["PT_Int[1]", "-1", "48", "PT_Int[196]"]}}
+[EXC] SubGraph parse failed i=1 what=unknown layer type: CustomOpOptions
+```
+
+qbcompiler 가 `torch.jit.trace` 계산 그래프를 분석할 때 `torch.reshape` 의 `-1` 인자를
+동적 값 `"PT_Int[-1]"` 로 추적하고, 이를 `CustomOpOptions` 레이어로 분류해 컴파일 실패한다.
+
+`relu_linear_att` 와 `relu_quadratic_att` 모두 두 곳씩 총 4군데가 영향을 받는다:
+
+```python
+# 변경 전 — -1 을 PyTorch 에 맡김
+B, _, H, W = list(qkv.size())
+qkv = torch.reshape(qkv, (B, -1,           3 * self.dim, H * W))
+...
+out = torch.reshape(out, (B, -1, H, W))
+```
+
+#### 수정
+
+```python
+# 변경 후 — 명시적 값으로 대체 (수학적으로 동일)
+B, C, H, W = list(qkv.size())
+n_groups = C // (3 * self.dim)
+qkv = torch.reshape(qkv, (B, n_groups,           3 * self.dim, H * W))
+...
+out = torch.reshape(out, (B, n_groups * self.dim, H,            W))
+```
+
+`-1` 은 `C // (3 * self.dim)` 과 항상 일치하므로 텐서 값 및 gradient 는 완전히 동일하다.
+훈련·pruning 과정에는 영향 없음.
+
+| 항목 | 내용 |
+|------|------|
+| 수정 파일 | `efficientvit/models/nn/ops.py` — `relu_linear_att`, `relu_quadratic_att` 각 2곳 |
+| 정확도 영향 | **없음** — 동일한 reshape 값을 명시적으로 지정 |
+| 학습/pruning 영향 | **없음** — PyTorch 연산 결과 bit-for-bit 동일 |
+| 적용 범위 | B/L 시리즈 전체, 원본·reduced 모델 모두 |

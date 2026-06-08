@@ -852,22 +852,16 @@ class LiteMLA(nn.Module):
         (V·Kᵀ) 를 먼저 계산해 (d+1, d) 크기의 중간 행렬로 축약한 뒤 Q 와 곱한다.
         정규화 분모(Σ K_j) 는 V 에 1 로 채워진 추가 행을 붙여 함께 계산한다.
         """
-        B, _, H, W = list(qkv.size())
+        B, C, H, W = list(qkv.size())
 
         # AMP 에서 fp16 로 들어오면 (V·Kᵀ)·Q 축적합에서 오버/언더플로가 쉽게 발생해 fp32 로 승격.
         if qkv.dtype == torch.float16:
             qkv = qkv.float()
 
-        # (B, 3*total_dim, H, W) -> (B, heads, 3*dim, H*W)
-        qkv = torch.reshape(
-            qkv,
-            (
-                B,
-                -1,
-                3 * self.dim,
-                H * W,
-            ),
-        )
+        # (B, 3*total_dim*(1+scales), H, W) -> (B, heads*(1+scales), 3*dim, H*W)
+        # -1 대신 명시적 값 사용: qbcompiler 가 -1 을 CustomOpOptions 로 처리해 컴파일 실패함.
+        n_groups = C // (3 * self.dim)
+        qkv = torch.reshape(qkv, (B, n_groups, 3 * self.dim, H * W))
         # 헤드당 dim 채널씩 Q, K, V 로 분리.
         q, k, v = (
             qkv[:, :, 0 : self.dim],
@@ -883,20 +877,17 @@ class LiteMLA(nn.Module):
         trans_k = k.transpose(-1, -2)
 
         # 분자: (V·Kᵀ)·Q — O(N·d²) 선형 어텐션 핵심.
-        vk = torch.matmul(v, trans_k)   # (B, heads, d, d)
-        out = torch.matmul(vk, q)       # (B, heads, d, N)
+        vk = torch.matmul(v, trans_k)   # (B, n_groups, d, d)
+        out = torch.matmul(vk, q)       # (B, n_groups, d, N)
         if out.dtype == torch.bfloat16:
             out = out.float()
         # 분모: Σ_j φ(K_j) · Q_i — F.pad+slice 대신 명시적 sum으로 계산.
-        # F.pad(v, (0,0,0,1)) + out[:,:,:-1]/out[:,:,-1:] 패턴은 qbcompiler
-        # 양자화기가 Slice/Pad 경계를 처리하지 못해 zeropoint overflow를 일으킨다.
-        # sum → matmul 로 바꾸면 수학적으로 동일하고 ONNX 그래프가 단순해진다.
-        k_sum = k.sum(dim=-1, keepdim=True)                    # (B, heads, d, 1)
-        out_den = torch.matmul(k_sum.transpose(-1, -2), q)    # (B, heads, 1, N)
+        k_sum = k.sum(dim=-1, keepdim=True)                    # (B, n_groups, d, 1)
+        out_den = torch.matmul(k_sum.transpose(-1, -2), q)    # (B, n_groups, 1, N)
         out = out / (out_den + self.eps)
 
-        # (B, heads*d, H, W) 로 복원.
-        out = torch.reshape(out, (B, -1, H, W))
+        # (B, n_groups*d, H, W) 로 복원. -1 대신 명시적 값 사용.
+        out = torch.reshape(out, (B, n_groups * self.dim, H, W))
         return out
 
     @torch.autocast(device_type="cuda", enabled=False)
@@ -907,18 +898,12 @@ class LiteMLA(nn.Module):
         선형 경로보다 빠르고 정확하다. 동일하게 ReLU 커널을 쓰지만, softmax 대신
         column-sum 정규화(분모를 명시적으로 계산) 를 적용한다.
         """
-        B, _, H, W = list(qkv.size())
+        B, C, H, W = list(qkv.size())
 
-        # (B, 3*total_dim, H, W) -> (B, heads, 3*dim, H*W)
-        qkv = torch.reshape(
-            qkv,
-            (
-                B,
-                -1,
-                3 * self.dim,
-                H * W,
-            ),
-        )
+        # (B, 3*total_dim, H, W) -> (B, n_groups, 3*dim, H*W)
+        # -1 대신 명시적 값 사용: qbcompiler 가 -1 을 CustomOpOptions 로 처리해 컴파일 실패함.
+        n_groups = C // (3 * self.dim)
+        qkv = torch.reshape(qkv, (B, n_groups, 3 * self.dim, H * W))
         q, k, v = (
             qkv[:, :, 0 : self.dim],
             qkv[:, :, self.dim : 2 * self.dim],
@@ -939,7 +924,8 @@ class LiteMLA(nn.Module):
         # 정규화된 맵을 V 와 곱해 최종 출력.
         out = torch.matmul(v, att_map)  # b h d n
 
-        out = torch.reshape(out, (B, -1, H, W))
+        # (B, n_groups*d, H, W) 로 복원. -1 대신 명시적 값 사용.
+        out = torch.reshape(out, (B, n_groups * self.dim, H, W))
         return out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
