@@ -74,6 +74,11 @@ DEFAULT_MODELS = [
         "assets/checkpoints/efficientvit_cls/efficientvit_b1_original_r224.pt",
         os.path.join(DEFAULT_OUT_DIR, "efficientvit_b1.pt"),
     ),
+    (
+        "efficientvit-b2",
+        "assets/checkpoints/efficientvit_cls/efficientvit_b2_original_r224.pt",
+        os.path.join(DEFAULT_OUT_DIR, "efficientvit_b2.pt"),
+    ),
 ]
 
 
