@@ -1653,63 +1653,49 @@ full model 버전 = "구조까지 포함된 완성된 파일" → 바로 열어�
 
 ---
 
-## ONNX 변환
+## NPU 배포용 PyTorch 모델 저장
 
 ### 개요
 
-학습된 `.pt` 체크포인트를 **NCHW 입력 ONNX 단일 파일**로 export 한다. Mobilint NPU
-컴파일(qbcompiler → `.mxq`)은 NPU 프로젝트의 Docker 안에서 수행되며, 그 단계에서
-`in_dformats={"input": "NCHW"}` 로 입력 레이아웃을 직접 선언한다. 따라서 ONNX 쪽은
-NCHW 그대로 두고 입력 텐서 이름만 `input` 으로 맞추면 된다.
+학습된 `.pt` 체크포인트를 **PyTorch `nn.Module` 객체 파일**로 저장해 NPU 프로젝트에 전달한다.
+NPU 프로젝트의 Docker 안에서 `mxq_compile(backend="torch")` 로 직접 컴파일하므로
+ONNX 변환 단계가 없다.
 
 | 스크립트 | 역할 |
 |----------|------|
-| `efficientvit/assets/export_original_to_onnx.py` | `.pt` → NCHW `.onnx` 변환 (입력명 `input`, 출력명 `output`) |
+| `efficientvit/assets/compile_example/export_torch_model.py` | `.pt` 체크포인트 → `nn.Module` 객체 파일 저장 |
 
-> **opset 13 사용 이유**  
-> Opset 11은 EfficientViT에 쓰이는 HardSwish 계열 활성화 함수를 단일 노드로 지원하지 않는다.  
-> NPU 배포 시 **opset 13 이상** 사용을 권장한다.
-
-> **⚠️ NHWC 그래프 재작성을 하지 않는 이유 (과거 `onnx_nhwc_convert.py` 제거 배경)**  
-> 이전에는 export 후 ONNX 앞에 Transpose 노드를 삽입해 입력을 NHWC `(1,224,224,3)` 로
-> 재작성했다. 그러나 이 그래프 재작성 과정에서 Slice 노드의 INT64 상수가
-> FLOAT64(double)로 잘못 저장 → qbcompiler 양자화기가 float 텐서로 인식 →
-> range=0 → scale=0 → zeropoint = -min/scale = ±inf → INT32 오버플로우 →
-> `zeropoint=-2147483648 is out of range` 로 양자화가 항상 깨졌다.  
-> ⇒ **NHWC 재작성을 폐기**하고, NCHW 그대로 export 한 뒤 compile 단계에서
-> `in_dformats` 로 NCHW 임을 선언하는 방식으로 전환했다. `torch.onnx.export` 직접
-> 경로는 상수를 INT64 로 올바르게 저장하므로 안전하다.  
-> (같은 이유로 onnxsim simplify 등 그래프 재작성 도구도 사용하지 않는다.)
+> **ONNX 경로를 사용하지 않는 이유**  
+> `backend="onnx"` 경로에서는 `LiteMLA.relu_linear_att` 내부의
+> `F.pad + Slice` 패턴이 qbcompiler 양자화기에서 zeropoint overflow 를 일으켰다.
+> `backend="torch"` 는 ONNX 변환 없이 모델을 직접 trace 하므로 이 문제가 원천 차단된다.
+> 자세한 내용은 [§10 LiteMLA 수정](#10-litemla-relu_linear_att-수정--qbcompiler-양자화-호환) 참고.
 
 ### 실행 환경 설정
 
-`export_original_to_onnx.py` 는 자신의 위치에서 repo 루트를 계산해 `sys.path` 에 자동
-추가하므로 **`PYTHONPATH` 설정이 필요 없다.** repo 루트에서 그냥 실행하면 된다.
-(`onnx` 패키지만 설치돼 있으면 됨: `pip install onnx`)
+`export_torch_model.py` 는 자신의 위치에서 repo 루트를 계산해 `sys.path` 에 자동 추가하므로
+**`PYTHONPATH` 설정이 필요 없다.** 추가 패키지 설치도 불필요하다.
 
-### 변환 명령어
+### 저장 명령어
 
-**원본 b0 / b1 한 번에 (인자 없이 실행 → 기본 배치 모드)**
+**원본 b0 / b1 / b2 한 번에 (인자 없이 실행 → 기본 배치 모드)**
 ```bash
-python efficientvit/assets/export_original_to_onnx.py
+python efficientvit/assets/compile_example/export_torch_model.py
 ```
-→ `assets/export_models/` 아래에 다음 2개 파일 생성:
-`efficientvit_b0_original_r224_nchw.onnx`, `efficientvit_b1_original_r224_nchw.onnx`
+→ `assets/torch_models/` 아래에 `efficientvit_b0.pt`, `efficientvit_b1.pt`, `efficientvit_b2.pt` 생성
 
-**특정 원본 모델 1개만 (registered 모델명 사용)**
+**특정 원본 모델 1개만**
 ```bash
-python efficientvit/assets/export_original_to_onnx.py \
-  --model efficientvit-b0 \
-  --weight assets/checkpoints/efficientvit_cls/efficientvit_b0_original_r224.pt \
-  --output assets/export_models/efficientvit_b0_original_r224_nchw.onnx
+python efficientvit/assets/compile_example/export_torch_model.py \
+  --source factory --model efficientvit-b1 \
+  --weight assets/checkpoints/efficientvit_cls/efficientvit_b1_original_r224.pt \
+  --output assets/torch_models/efficientvit_b1.pt
 ```
 
 **pruning 후 reduce 된 모델 (채널이 줄어든 구조)**
 
-reduce 된 모델은 채널 수가 달라 registered 팩토리(`create_efficientvit_cls_model`)로는
-구조를 재현할 수 없다. 따라서 [`efficientvit_reducing.py`](efficientvit/clscore/pruning/efficientvit_reducing.py)
-를 `--save-full-model` 로 **전체 모델 객체**로 저장한 뒤, export 시 `--source full-model`
-로 그 객체를 통째로 로드한다.
+reduce 된 모델은 [`efficientvit_reducing.py`](efficientvit/clscore/pruning/efficientvit_reducing.py)
+를 `--save-full-model` 로 **전체 모델 객체**로 저장한 뒤 그대로 전달한다.
 ```bash
 # 1) reduce 결과를 full-model 객체로 저장
 python -m efficientvit.clscore.pruning.efficientvit_reducing \
@@ -1718,45 +1704,57 @@ python -m efficientvit.clscore.pruning.efficientvit_reducing \
   --output assets/export_models/efficientvit_b1_reduced.pt \
   --save-full-model
 
-# 2) full-model 객체 → NCHW ONNX
-python efficientvit/assets/export_original_to_onnx.py \
+# 2) full-model 객체를 NPU용 torch 모델로 저장
+python efficientvit/assets/compile_example/export_torch_model.py \
   --source full-model \
   --weight assets/export_models/efficientvit_b1_reduced.pt \
-  --output assets/export_models/efficientvit_b1_reduced_r224_nchw.onnx
+  --output assets/torch_models/efficientvit_b1_reduced.pt
 ```
 
 ### 주요 인자
 
-**export_original_to_onnx.py**
-
 | 인자 | 설명 |
 |------|------|
 | `--source` | `factory`(기본, registered 원본 모델) / `full-model`(reduce 된 전체 모델 객체) |
-| `--model` | registered 모델명 (예: `efficientvit-b0`). `--source factory` 에 필요 |
+| `--model` | registered 모델명 (예: `efficientvit-b1`). `--source factory` 에 필요 |
 | `--weight` | 로드할 `.pt` 경로 |
-| `--output` | 출력 `.onnx` 경로 |
-| `--resolution` | 입력 해상도 (기본값: 224) |
-| `--opset` | ONNX opset 버전 (기본값: 13) |
+| `--output` | 저장할 `.pt` 경로 |
 
-> `--weight`/`--output` 을 주면 단일 모델 모드, 둘 다 생략하면 원본 b0/b1 배치 모드로 동작한다.
-
-### 성공 기준 (스크립트 출력으로 확인)
-
-- `ONNX 검증 통과 | 입력 'input' shape=[1, 3, 224, 224]` ← 입력 이름 `input`, shape `[1,3,224,224]`
-- `[OK] FLOAT64 상수 없음` ← `[WARNING]` 이 뜨면 ONNX 가 오염된 것이니 실패로 간주
-- 종료 코드 0 (검증 실패 시 1)
+> `--weight`/`--output` 을 주면 단일 모델 모드, 둘 다 생략하면 원본 b0/b1/b2 배치 모드로 동작한다.
 
 ### 출력 파일
 
 | 파일 | 용도 |
 |------|------|
-| `assets/export_models/efficientvit_b0_original_r224_nchw.onnx` | 원본 b0, NCHW ONNX (NPU 컴파일 입력) |
-| `assets/export_models/efficientvit_b1_original_r224_nchw.onnx` | 원본 b1, NCHW ONNX (NPU 컴파일 입력) |
-| `assets/export_models/efficientvit_b1_reduced_r224_nchw.onnx` | (예시) reduce 된 b1, NCHW ONNX |
+| `assets/torch_models/efficientvit_b0.pt` | 원본 b0 `nn.Module` 객체 (NPU 컴파일 입력) |
+| `assets/torch_models/efficientvit_b1.pt` | 원본 b1 `nn.Module` 객체 (NPU 컴파일 입력) |
+| `assets/torch_models/efficientvit_b2.pt` | 원본 b2 `nn.Module` 객체 (NPU 컴파일 입력) |
+| `assets/torch_models/efficientvit_b1_reduced.pt` | (예시) reduce 된 b1 `nn.Module` 객체 |
 
-> 생성된 `.onnx` 를 NPU 프로젝트로 가져가 Docker 안에서 qbcompiler 로 `.mxq` 컴파일한다.
-> 캘리브레이션 데이터는 CHW `(3,224,224)` float32 `.npy`(ImageNet 정규화)이며, 이 export
-> 단계에서는 만들지 않는다.
+### NPU 프로젝트에서의 사용법
+
+저장된 `.pt` 를 NPU 프로젝트로 복사한 뒤 `compile_torch.py` 에서 아래와 같이 로드한다.
+
+```python
+import torch
+from qbcompiler import mxq_compile
+
+model = torch.load("efficientvit_b1.pt", map_location="cpu", weights_only=False)
+model.eval().cpu()
+
+mxq_compile(
+    model=model,
+    backend="torch",
+    feed_dict={"x": torch.randn(1, 3, 224, 224)},
+    calib_data_path=CALIB_TXT,   # HWC (224, 224, 3) 포맷
+    save_path=mxq_path,
+    ...
+)
+```
+
+> **⚠️ 캘리브레이션 데이터 포맷**  
+> `backend="torch"` 는 **HWC `(224, 224, 3)`** 포맷을 사용한다.  
+> 기존 ONNX 경로의 CHW `(3, 224, 224)` 와 다르므로 캘리브레이션 데이터를 별도로 준비해야 한다.
 
 ---
 
