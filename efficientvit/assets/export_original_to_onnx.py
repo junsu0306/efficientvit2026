@@ -22,7 +22,7 @@
 [절대 지켜야 할 제약 — 어기면 NPU 양자화가 실패한다]
   • 입력 레이아웃은 반드시 NCHW (1, 3, 224, 224). NHWC 로 바꾸지 마라.
   • 입력 텐서 이름은 반드시 "input", 출력은 "output".
-  • opset_version=13, do_constant_folding=True 유지.
+  • opset_version=11, do_constant_folding=True 유지.
   • ★ NHWC 변환/그래프 재작성 도구(onnxsim 포함)를 쓰지 마라. ★
     이 스크립트는 export 후 FLOAT64(data_type==11) 상수가 있으면 경고한다.
     그 경고가 뜨면 ONNX 가 오염된 것이니 멈추고 원인을 찾아라.
@@ -74,7 +74,7 @@ from efficientvit.cls_model_zoo import create_efficientvit_cls_model  # noqa: E4
 
 # ─── 기본 설정 ────────────────────────────────────────────────────────────────
 DEFAULT_RESOLUTION = 224
-DEFAULT_OPSET = 13
+DEFAULT_OPSET = 11
 DEFAULT_OUT_DIR = os.path.join(REPO_ROOT, "assets", "export_models")
 
 # 인자 없이 실행했을 때 export 할 원본 모델 목록.
@@ -146,7 +146,7 @@ def export_to_onnx(model: torch.nn.Module, onnx_path: str, resolution: int, opse
             model,
             dummy_input,
             onnx_path,
-            opset_version=opset,         # ← 유지 (13)
+            opset_version=opset,         # ← 유지 (11)
             input_names=["input"],       # ← 유지 (compile 이 참조)
             output_names=["output"],     # ← 유지
             do_constant_folding=True,    # ← 유지
