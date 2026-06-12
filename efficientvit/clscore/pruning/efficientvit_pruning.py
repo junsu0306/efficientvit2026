@@ -760,40 +760,70 @@ class EfficientViTPruner:
 
     @torch.no_grad()
     def log_sparsity(self, model: nn.Module) -> dict[str, float]:
-        """실제 마스킹된 zero 비율 (검증용). MBConv/FusedMBConv mid + Stem + Head 출력 채널."""
+        """실제 마스킹된 zero 비율. 전체 합산 + 레이어별 세분화.
+
+        반환 키:
+          layer/<module_path>  — MBConv/FusedMBConv mid 채널의 zero 비율 (레이어별)
+          layer/input_stem     — Stem 출력 채널 zero 비율
+          layer/head_in_conv   — Head in_conv zero 비율
+          layer/head_cls       — Head classifier linear zero 비율
+          actual_sparsity      — 전체 prunable 채널 대비 zero 비율
+          zero_filters         — zero 채널 수
+          prunable_filters     — 전체 prunable 채널 수
+          target_sparsity      — 목표 sparsity
+        """
+        result: dict[str, float] = {}
         n_total = 0
         n_zero = 0
-        for kind, mod in _iter_prunable_modules(model):
-            if kind == "mbconv":
-                w = mod.inverted_conv.conv.weight
+
+        # MBConv / FusedMBConv — named_modules 로 이름 포함 순회
+        for name, module in model.named_modules():
+            if isinstance(module, MBConv):
+                w = module.inverted_conv.conv.weight
+            elif isinstance(module, FusedMBConv):
+                w = module.spatial_conv.conv.weight
             else:
-                w = mod.spatial_conv.conv.weight
+                continue
             n_filt = w.shape[0]
             norms = torch.norm(w.detach().reshape(n_filt, -1), dim=1)
+            n_z = int((norms == 0).sum().item())
             n_total += n_filt
-            n_zero += int((norms == 0).sum().item())
+            n_zero += n_z
+            # wandb 는 '/' 를 계층 구분자로 해석 → 점을 슬래시로 치환
+            result[f"layer/{name.replace('.', '/')}"] = n_z / max(n_filt, 1)
+
+        # Input Stem
         stem = _get_stem_op_seq(model)
         if stem is not None and len(stem.op_list) > 0 and isinstance(stem.op_list[0], ConvLayer):
             w = stem.op_list[0].conv.weight
             n_filt = w.shape[0]
             norms = torch.norm(w.detach().reshape(n_filt, -1), dim=1)
+            n_z = int((norms == 0).sum().item())
             n_total += n_filt
-            n_zero += int((norms == 0).sum().item())
+            n_zero += n_z
+            result["layer/input_stem"] = n_z / max(n_filt, 1)
+
+        # Head
         if self.head_sparsity_scale > 0 and _has_prunable_head(model):
             head = model.head  # type: ignore[attr-defined]
             w0 = head.op_list[0].conv.weight
             n0 = w0.shape[0]
             norms0 = torch.norm(w0.detach().reshape(n0, -1), dim=1)
+            n_z0 = int((norms0 == 0).sum().item())
             n_total += n0
-            n_zero += int((norms0 == 0).sum().item())
+            n_zero += n_z0
+            result["layer/head_in_conv"] = n_z0 / max(n0, 1)
+
             w1 = head.op_list[2].linear.weight
             n1 = w1.shape[0]
             norms1 = torch.norm(w1.detach(), dim=1)
+            n_z1 = int((norms1 == 0).sum().item())
             n_total += n1
-            n_zero += int((norms1 == 0).sum().item())
-        return {
-            "prunable_filters": n_total,
-            "zero_filters": n_zero,
-            "actual_sparsity": n_zero / max(n_total, 1),
-            "target_sparsity": self.sparsity,
-        }
+            n_zero += n_z1
+            result["layer/head_cls"] = n_z1 / max(n1, 1)
+
+        result["prunable_filters"] = n_total
+        result["zero_filters"] = n_zero
+        result["actual_sparsity"] = n_zero / max(n_total, 1)
+        result["target_sparsity"] = self.sparsity
+        return result
